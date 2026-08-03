@@ -1,0 +1,29 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# API keys and machine-local configuration
+.env
+.env.*
+!.env.example
+/local_config.py
+
+# Captured sensor data and generated results
+/captures/
+/runs/
+/gemini_result.json
+*.bag
+
+# External repositories, environments, and model weights
+/VLPart/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# Local-only notes
+/AFFORDGRASP_CODE_GUIDE.md
