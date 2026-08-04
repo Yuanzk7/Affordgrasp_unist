@@ -32,6 +32,13 @@ export OPENAI_API_KEY="본인의_OpenAI_API_KEY"
 export AFFORDGRASP_PROVIDER=openai
 ```
 
+D435의 원본 metric depth를 저장하기 위해 실행하는 Python 환경에
+`pyrealsense2`가 필요하다.
+
+```bash
+python -m pip install pyrealsense2
+```
+
 VLPart runtime은 다음 위치에 있어야 한다.
 
 ```text
@@ -63,7 +70,10 @@ prefix를 사용한다.
 ```text
 captures/icar_d435/
 ├── 01_pliers_rgb.png
-└── 01_pliers_depth_preview.png
+├── 01_pliers_depth_raw.png
+├── 01_pliers_depth_filtered.png
+├── 01_pliers_depth_preview.png
+└── 01_pliers_camera.json
 
 runs/01_pliers/
 ├── json/
@@ -84,16 +94,27 @@ runs/01_pliers/
 JSON은 장면별 `json/` 폴더 한 곳에 모이고, 이미지는 각 처리 단계 폴더에
 저장된다.
 
+- `depth_raw.png`: RGB 픽셀 좌표에 정렬된 무손실 `uint16` Z16 depth
+- `depth_filtered.png`: spatial/temporal 및 작은 틈 보간 후처리 depth
+- `depth_preview.png`: 사람이 확인하는 컬러 이미지이며 3D 계산에 사용하지 않음
+- `camera.json`: depth scale, `fx`, `fy`, `cx`, `cy`, 유효·보간 depth 비율
+
+미터 단위 거리는 `depth_raw_value * depth_scale_meters_per_unit`로 계산한다.
+Point cloud와 AnyGrasp에는 preview가 아니라 raw 또는 filtered depth와
+`camera.json`을 사용해야 한다.
+
 ## 5. 결과 확인
 
 다음 파일을 직접 열어 실제 물체와 결과가 일치하는지 확인한다.
 
 1. `01_pliers_rgb.png`: 대상 물체 전체와 잡을 part가 보이는지 확인
-2. `top_k_candidates.png`: 대상 물체가 번호 후보 중 하나에 포함됐는지 확인
-3. `selected_object_overlay.png`: Gemini가 올바른 번호를 골랐는지 확인
-4. `masked_object.png`: 선택된 bounding box 내부만 남았는지 확인
-5. `affordance_overlay.png`: cyan 영역이 ICAR가 선택한 part인지 확인
-6. `grounding_request.json`: object, part, affordance가 실제 장면과 일치하는지 확인
+2. `01_pliers_depth_preview.png`: 대상 영역의 검은 depth hole을 확인
+3. `01_pliers_camera.json`: `filtered_valid_ratio`와 intrinsics를 확인
+4. `top_k_candidates.png`: 대상 물체가 번호 후보 중 하나에 포함됐는지 확인
+5. `selected_object_overlay.png`: Gemini가 올바른 번호를 골랐는지 확인
+6. `masked_object.png`: 선택된 bounding box 내부만 남았는지 확인
+7. `affordance_overlay.png`: cyan 영역이 ICAR가 선택한 part인지 확인
+8. `grounding_request.json`: object, part, affordance가 실제 장면과 일치하는지 확인
 
 `object_localization.json`에는 전체 후보의 번호, bbox, VLPart 점수와 Gemini가
 선택한 번호, confidence, 선택 이유가 함께 기록된다.

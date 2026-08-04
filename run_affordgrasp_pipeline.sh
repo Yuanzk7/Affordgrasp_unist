@@ -110,6 +110,9 @@ python -m affordgrasp_icar.affordance_mask_cli \
 
 printf 'AffordGrasp 실행 완료\n'
 printf 'RGB: %s\n' "$PIPELINE_RGB_IMAGE"
+printf 'Raw depth: %s\n' "$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_raw.png"
+printf 'Filtered depth: %s\n' "$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_filtered.png"
+printf 'Camera info: %s\n' "$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_camera.json"
 printf 'JSON: %s\n' "$PIPELINE_JSON_DIR"
 printf 'Top-k candidates: %s\n' "$PIPELINE_LOCALIZATION_DIR/top_k_candidates.png"
 printf 'Selected object: %s\n' "$PIPELINE_LOCALIZATION_DIR/selected_object_overlay.png"

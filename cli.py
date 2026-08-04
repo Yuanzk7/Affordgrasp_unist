@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--capture-dir",
         type=Path,
         default=Path("captures"),
-        help="--camera로 캡처한 RGB/depth preview 저장 폴더",
+        help="--camera로 캡처한 RGB/raw·filtered depth 저장 폴더",
     )
     parser.add_argument(
         "--capture-prefix",
@@ -157,7 +157,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         image_path = str(capture.rgb_path)
         print(
             "RealSense 캡처 완료: "
-            f"RGB={capture.rgb_path}, depth preview={capture.depth_preview_path}",
+            f"RGB={capture.rgb_path}, "
+            f"raw depth={capture.depth_raw_path}, "
+            f"filtered depth={capture.depth_filtered_path}, "
+            f"camera info={capture.camera_info_path}, "
+            f"depth valid={capture.raw_valid_ratio:.1%}"
+            f"→{capture.filtered_valid_ratio:.1%}",
             file=sys.stderr,
         )
         if args.capture_only:
