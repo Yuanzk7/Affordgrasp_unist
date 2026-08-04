@@ -693,7 +693,7 @@ def _gemini_api_key() -> str:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         try:
-            from . import local_config
+            from .. import local_config
         except ImportError:
             local_config = None
         local_value = (
@@ -886,32 +886,6 @@ class GeminiTopKObjectSelector:
             method="gemini-top-k",
             model=self.config.model,
         )
-
-
-def localize_object(
-    image_bgr: np.ndarray,
-    object_name: str,
-    detector: ObjectDetector,
-    minimum_score: float = 0.5,
-) -> Tuple[np.ndarray, Tuple[int, int, int, int], float]:
-    """Select the highest-scoring VLPart box and create the M_BO image."""
-
-    if not 0.0 <= minimum_score <= 1.0:
-        raise ValueError("minimum_score must be between 0 and 1")
-    query = _require_object_name(object_name)
-    detections = [
-        detection
-        for detection in detector.predict(image_bgr, query)
-        if detection.score >= minimum_score
-    ]
-    if not detections:
-        raise ObjectLocalizationError(
-            f"VLPart found no {query!r} object above score {minimum_score:.2f}"
-        )
-
-    selected = max(detections, key=lambda detection: detection.score)
-    masked, box = create_masked_box_image(image_bgr, selected.bbox_xyxy)
-    return masked, box, selected.score
 
 
 def localize_object_file(

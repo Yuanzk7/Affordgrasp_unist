@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .camera import CameraCaptureError, capture_realsense
+from ..camera import CameraCaptureError, capture_realsense
 from .reasoner import (
     AffordanceReasoner,
     AffordanceReasonerConfig,
@@ -64,13 +64,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--image-detail",
-        choices=("low", "high", "original", "auto"),
+        choices=("low", "high", "auto"),
         default="high",
         help="ICAR는 기본적으로 part 인식을 위해 high를 사용합니다.",
     )
     parser.add_argument(
         "--reasoning-effort",
-        choices=("none", "low", "medium", "high", "xhigh", "max"),
+        choices=("low", "medium", "high"),
         default="medium",
     )
     parser.add_argument(
@@ -78,16 +78,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.70,
         help="후속 grounding으로 전달할 최소 신뢰도 (기본 0.70)",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="전체 추론 결과 JSON을 저장할 경로",
-    )
-    parser.add_argument(
-        "--grounding-output",
-        type=Path,
-        help="안전 게이트를 통과한 grounding 요청 JSON을 저장할 경로",
     )
     parser.add_argument(
         "--json-dir",
@@ -108,36 +98,11 @@ def _write_json(path: Path, payload: object) -> None:
     )
 
 
-def _resolve_json_paths(
-    json_dir: Optional[Path],
-    output: Optional[Path],
-    grounding_output: Optional[Path],
-) -> tuple[Optional[Path], Optional[Path]]:
-    if json_dir is None:
-        return output, grounding_output
-    if output is not None or grounding_output is not None:
-        raise ValueError(
-            "--json-dir cannot be combined with --output or --grounding-output"
-        )
-    return (
-        json_dir / "icar_result.json",
-        json_dir / "grounding_request.json",
-    )
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not 0.0 <= args.min_confidence <= 1.0:
         parser.error("--min-confidence must be between 0 and 1")
-    try:
-        result_output, grounding_output = _resolve_json_paths(
-            args.json_dir,
-            args.output,
-            args.grounding_output,
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
 
     image_path = args.image
     if args.capture_only and not args.camera:
@@ -189,8 +154,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     payload = result.to_dict()
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    if result_output:
-        _write_json(result_output, payload)
+    if args.json_dir is not None:
+        _write_json(args.json_dir / "icar_result.json", payload)
 
     if not result.actionable_at(args.min_confidence):
         reason = result.failure_reason or (
@@ -202,9 +167,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 3
 
-    if grounding_output:
-        grounding = result.to_grounding_request(
-            args.min_confidence
-        ).to_dict()
-        _write_json(grounding_output, grounding)
+    if args.json_dir is not None:
+        grounding = result.to_grounding_request(args.min_confidence).to_dict()
+        _write_json(args.json_dir / "grounding_request.json", grounding)
     return 0

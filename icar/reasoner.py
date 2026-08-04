@@ -69,25 +69,10 @@ class AffordanceReasonerConfig:
             raise ValueError("model must not be empty")
         object.__setattr__(self, "model", model.strip())
 
-        if self.image_detail not in {"low", "high", "original", "auto"}:
-            raise ValueError("image_detail must be low, high, original, or auto")
-        if self.reasoning_effort not in {
-            "none",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max",
-        }:
-            raise ValueError("unsupported reasoning_effort")
-        if provider == "gemini" and self.reasoning_effort not in {
-            "low",
-            "medium",
-            "high",
-        }:
-            raise ValueError(
-                "Gemini reasoning_effort must be low, medium, or high"
-            )
+        if self.image_detail not in {"low", "high", "auto"}:
+            raise ValueError("image_detail must be low, high, or auto")
+        if self.reasoning_effort not in {"low", "medium", "high"}:
+            raise ValueError("reasoning_effort must be low, medium, or high")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
@@ -155,29 +140,27 @@ class AffordanceReasoner:
             return self._client
 
         if self.config.provider == "gemini":
-            environment_key = "GEMINI_API_KEY"
-            local_key = "GEMINI_API_KEY"
+            key_name = "GEMINI_API_KEY"
             provider_name = "Gemini"
         else:
-            environment_key = "OPENAI_API_KEY"
-            local_key = "OPENAI_API_KEY"
+            key_name = "OPENAI_API_KEY"
             provider_name = "OpenAI"
 
-        api_key = os.environ.get(environment_key, "").strip()
+        api_key = os.environ.get(key_name, "").strip()
         if not api_key:
             try:
-                from . import local_config
+                from .. import local_config
             except ImportError:
                 local_config = None
             local_value = (
-                getattr(local_config, local_key, "") if local_config else ""
+                getattr(local_config, key_name, "") if local_config else ""
             )
             if isinstance(local_value, str):
                 api_key = local_value.strip()
 
         if not api_key:
             raise ConfigurationError(
-                f"{provider_name} API key is missing; set {environment_key} "
+                f"{provider_name} API key is missing; set {key_name} "
                 "or configure affordgrasp_icar/local_config.py"
             )
         try:
@@ -301,7 +284,3 @@ class AffordanceReasoner:
             return AffordanceReasoningResult.from_dict(payload)
         except InvalidReasoningResult as exc:
             raise ReasoningError(f"invalid affordance reasoning result: {exc}") from exc
-
-
-# Backward-compatible name retained for existing callers.
-OpenAIAffordanceReasoner = AffordanceReasoner

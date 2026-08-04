@@ -1,17 +1,16 @@
 """In-Context Affordance Reasoning for an AffordGrasp-style pipeline."""
 
 from .camera import CameraCaptureError, RealSenseCapture, capture_realsense
-from .models import (
+from .icar.models import (
     AffordanceReasoningResult,
     GroundingRequest,
     InvalidReasoningResult,
     UnsafeGroundingRequest,
 )
-from .reasoner import (
+from .icar.reasoner import (
     AffordanceReasoner,
     AffordanceReasonerConfig,
     ConfigurationError,
-    OpenAIAffordanceReasoner,
     ReasoningError,
 )
 
@@ -23,7 +22,6 @@ __all__ = [
     "ConfigurationError",
     "GroundingRequest",
     "InvalidReasoningResult",
-    "OpenAIAffordanceReasoner",
     "RealSenseCapture",
     "ReasoningError",
     "UnsafeGroundingRequest",

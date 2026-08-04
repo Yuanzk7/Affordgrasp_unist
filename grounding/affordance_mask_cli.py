@@ -65,8 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confidence-threshold",
         type=float,
-        default=0.10,
-        help="최소 VLPart part score (기본: 0.10)",
+        default=0.01,
+        help="최소 VLPart part score (기본: 0.01)",
     )
     parser.add_argument(
         "--input-size",
