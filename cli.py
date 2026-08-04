@@ -89,6 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="안전 게이트를 통과한 grounding 요청 JSON을 저장할 경로",
     )
+    parser.add_argument(
+        "--json-dir",
+        type=Path,
+        help=(
+            "모든 ICAR JSON을 모을 폴더 "
+            "(icar_result.json, grounding_request.json)"
+        ),
+    )
     return parser
 
 
@@ -100,11 +108,36 @@ def _write_json(path: Path, payload: object) -> None:
     )
 
 
+def _resolve_json_paths(
+    json_dir: Optional[Path],
+    output: Optional[Path],
+    grounding_output: Optional[Path],
+) -> tuple[Optional[Path], Optional[Path]]:
+    if json_dir is None:
+        return output, grounding_output
+    if output is not None or grounding_output is not None:
+        raise ValueError(
+            "--json-dir cannot be combined with --output or --grounding-output"
+        )
+    return (
+        json_dir / "icar_result.json",
+        json_dir / "grounding_request.json",
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not 0.0 <= args.min_confidence <= 1.0:
         parser.error("--min-confidence must be between 0 and 1")
+    try:
+        result_output, grounding_output = _resolve_json_paths(
+            args.json_dir,
+            args.output,
+            args.grounding_output,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     image_path = args.image
     if args.capture_only and not args.camera:
@@ -128,7 +161,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         if args.capture_only:
-            print(json.dumps(capture.to_dict(), ensure_ascii=False, indent=2))
+            capture_payload = capture.to_dict()
+            print(json.dumps(capture_payload, ensure_ascii=False, indent=2))
+            if args.json_dir is not None:
+                _write_json(
+                    args.json_dir / "capture_result.json",
+                    capture_payload,
+                )
             return 0
 
     try:
@@ -145,8 +184,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     payload = result.to_dict()
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    if args.output:
-        _write_json(args.output, payload)
+    if result_output:
+        _write_json(result_output, payload)
 
     if not result.actionable_at(args.min_confidence):
         reason = result.failure_reason or (
@@ -158,9 +197,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 3
 
-    if args.grounding_output:
+    if grounding_output:
         grounding = result.to_grounding_request(
             args.min_confidence
         ).to_dict()
-        _write_json(args.grounding_output, grounding)
+        _write_json(grounding_output, grounding)
     return 0
