@@ -37,6 +37,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="ICAR가 생성한 grounding_request.json",
     )
     parser.add_argument(
+        "--object-alias",
+        action="append",
+        default=[],
+        help=(
+            "추가 VLPart object query; 여러 번 지정 가능. "
+            "알려진 객체에는 built-in alias가 자동 적용됩니다."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("runs/object_localization"),
@@ -159,6 +168,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             top_k=arguments.top_k,
             selector=selector,
             selection_context=selection_context,
+            object_aliases=arguments.object_alias,
         )
     except (ObjectLocalizationError, ValueError) as exc:
         print(f"Object Localization 오류: {exc}", file=sys.stderr)

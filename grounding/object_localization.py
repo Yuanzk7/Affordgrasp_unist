@@ -34,6 +34,7 @@ class ObjectDetection:
 
     bbox_xyxy: Tuple[float, float, float, float]
     score: float
+    query: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,12 +44,17 @@ class RankedObjectCandidate:
     rank: int
     bbox_xyxy: Tuple[int, int, int, int]
     vlpart_score: float
+    vlpart_query: str = ""
+    matched_queries: Tuple[str, ...] = ()
 
     def to_dict(self, selected_rank: Optional[int] = None) -> Dict[str, Any]:
         return {
             "rank": self.rank,
             "bbox_xyxy": list(self.bbox_xyxy),
             "vlpart_score": self.vlpart_score,
+            "vlpart_query": self.vlpart_query,
+            "matched_queries": list(self.matched_queries),
+            "alias_support": len(self.matched_queries),
             "selected": self.rank == selected_rank,
         }
 
@@ -112,6 +118,7 @@ class ObjectLocalizationResult:
     """Serializable result of AffordGrasp object localization."""
 
     object_name: str
+    query_aliases: Tuple[str, ...]
     bbox_xyxy: Tuple[int, int, int, int]
     score: float
     image_width: int
@@ -130,6 +137,7 @@ class ObjectLocalizationResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "object_name": self.object_name,
+            "query_aliases": list(self.query_aliases),
             "bbox_xyxy": list(self.bbox_xyxy),
             "score": self.score,
             "image_width": self.image_width,
@@ -180,7 +188,8 @@ class VLPartObjectDetector:
         if config.device not in ("auto", "cpu", "cuda"):
             raise ValueError("device must be one of: auto, cpu, cuda")
         self.config = config
-        self._demos: Dict[str, Any] = {}
+        self._demo: Optional[Any] = None
+        self._active_queries: Tuple[str, ...] = ()
 
     def _validate_runtime_paths(self) -> Tuple[Path, Path, Path]:
         root = self.config.root.expanduser().resolve()
@@ -316,31 +325,41 @@ class VLPartObjectDetector:
         )
         return VisualizationDemo(cfg, arguments)
 
-    def _predict_instances(
-        self,
-        image_bgr: np.ndarray,
-        vocabulary_query: str,
-    ) -> Any:
-        """Run one custom-vocabulary query and return CPU Detectron2 instances."""
-
-        query = _require_object_name(vocabulary_query)
-        if "," in query:
-            raise ObjectLocalizationError(
-                "VLPart vocabulary query must contain exactly one class"
-            )
-
-        demo = self._demos.get(query)
-        if demo is None:
+    def _demo_for_queries(self, vocabulary_queries: Sequence[str]) -> Any:
+        queries = _normalize_object_queries(vocabulary_queries)
+        if self._demo is None:
             try:
-                demo = self._build_demo(query)
+                self._demo = self._build_demo(queries[0])
             except ObjectLocalizationError:
                 raise
             except Exception as exc:
                 raise ObjectLocalizationError(
-                    f"VLPart initialization failed for object query {query!r}: {exc}"
+                    "VLPart initialization failed for object queries "
+                    f"{queries!r}: {exc}"
                 ) from exc
-            self._demos[query] = demo
 
+        if queries != self._active_queries:
+            try:
+                from demo.predictor import get_clip_embeddings, reset_cls_test
+
+                classifier = get_clip_embeddings(list(queries))
+                reset_cls_test(self._demo.predictor.model, classifier)
+            except Exception as exc:
+                raise ObjectLocalizationError(
+                    f"VLPart could not encode object aliases {queries!r}: {exc}"
+                ) from exc
+            self._active_queries = queries
+        return self._demo
+
+    def _predict_instances(
+        self,
+        image_bgr: np.ndarray,
+        vocabulary_queries: Sequence[str],
+    ) -> Any:
+        """Run custom-vocabulary aliases in one VLPart forward pass."""
+
+        queries = _normalize_object_queries(vocabulary_queries)
+        demo = self._demo_for_queries(queries)
         try:
             predictions = demo.predictor(image_bgr)
             instances = predictions.get("instances")
@@ -351,7 +370,7 @@ class VLPartObjectDetector:
             raise
         except Exception as exc:
             raise ObjectLocalizationError(
-                f"VLPart inference failed for query {query!r}: {exc}"
+                f"VLPart inference failed for object aliases {queries!r}: {exc}"
             ) from exc
 
     def predict(
@@ -359,30 +378,42 @@ class VLPartObjectDetector:
         image_bgr: np.ndarray,
         object_name: str,
     ) -> Sequence[ObjectDetection]:
-        query = _require_object_name(object_name)
+        return self.predict_many(image_bgr, (_require_object_name(object_name),))
+
+    def predict_many(
+        self,
+        image_bgr: np.ndarray,
+        object_names: Sequence[str],
+    ) -> Sequence[ObjectDetection]:
+        queries = _normalize_object_queries(object_names)
 
         try:
-            instances = self._predict_instances(image_bgr, query)
+            instances = self._predict_instances(image_bgr, queries)
             if instances is None:
                 return []
             boxes = instances.pred_boxes.tensor.detach().numpy()
             scores = instances.scores.detach().numpy()
+            classes = instances.pred_classes.detach().numpy()
         except Exception as exc:
             if isinstance(exc, ObjectLocalizationError):
                 raise
             raise ObjectLocalizationError(
-                f"VLPart inference failed for object query {query!r}: {exc}"
+                f"VLPart inference failed for object aliases {queries!r}: {exc}"
             ) from exc
 
         detections: List[ObjectDetection] = []
-        for box, score in zip(boxes, scores):
+        for box, score, class_index in zip(boxes, scores, classes):
             score_value = float(score)
             if score_value < self.config.confidence_threshold:
+                continue
+            index = int(class_index)
+            if not 0 <= index < len(queries):
                 continue
             detections.append(
                 ObjectDetection(
                     bbox_xyxy=tuple(float(value) for value in box),
                     score=score_value,
+                    query=queries[index],
                 )
             )
         return detections
@@ -392,6 +423,117 @@ def _require_object_name(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ObjectLocalizationError("object_name must be a non-empty string")
     return value.strip()
+
+
+_DEFAULT_OBJECT_ALIAS_GROUPS: Dict[str, Tuple[str, ...]] = {
+    "toilet paper": (
+        "toilet paper",
+        "toilet paper roll",
+        "toilet roll",
+        "bathroom tissue roll",
+        "paper roll",
+    ),
+    "toilet paper roll": (
+        "toilet paper roll",
+        "toilet paper",
+        "toilet roll",
+        "bathroom tissue roll",
+        "paper roll",
+    ),
+    "toilet roll": (
+        "toilet roll",
+        "toilet paper",
+        "toilet paper roll",
+        "bathroom tissue roll",
+        "paper roll",
+    ),
+    "bathroom tissue roll": (
+        "bathroom tissue roll",
+        "toilet paper",
+        "toilet paper roll",
+        "toilet roll",
+        "paper roll",
+    ),
+    "paper towel": (
+        "paper towel",
+        "paper towel roll",
+        "kitchen paper roll",
+        "kitchen roll",
+    ),
+    "paper towel roll": (
+        "paper towel roll",
+        "paper towel",
+        "kitchen paper roll",
+        "kitchen roll",
+    ),
+}
+
+
+def _normalize_object_queries(
+    queries: Union[str, Sequence[str]],
+) -> Tuple[str, ...]:
+    # A string is also a Sequence[str], but here it represents one complete
+    # VLPart query rather than a sequence of one-character aliases.
+    if isinstance(queries, str):
+        queries = (queries,)
+
+    normalized: List[str] = []
+    seen = set()
+    for raw_query in queries:
+        query = _require_object_name(raw_query)
+        if "," in query:
+            raise ObjectLocalizationError(
+                "one VLPart object alias must not contain a comma"
+            )
+        key = query.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(query)
+    if not normalized:
+        raise ObjectLocalizationError("at least one object query is required")
+    if len(normalized) > 12:
+        raise ObjectLocalizationError("at most 12 object aliases are supported")
+    return tuple(normalized)
+
+
+def build_object_query_aliases(
+    object_name: str,
+    extra_aliases: Sequence[str] = (),
+) -> Tuple[str, ...]:
+    """Return the canonical ICAR name plus built-in and user aliases."""
+
+    canonical = _require_object_name(object_name)
+    built_in = _DEFAULT_OBJECT_ALIAS_GROUPS.get(
+        canonical.casefold(),
+        (canonical,),
+    )
+    return _normalize_object_queries((canonical, *built_in, *extra_aliases))
+
+
+def predict_object_aliases(
+    detector: ObjectDetector,
+    image_bgr: np.ndarray,
+    queries: Sequence[str],
+) -> Tuple[ObjectDetection, ...]:
+    """Run aliases through an optimized multi-query detector when available."""
+
+    normalized = _normalize_object_queries(queries)
+    predict_many = getattr(detector, "predict_many", None)
+    if callable(predict_many):
+        return tuple(predict_many(image_bgr, normalized))
+
+    detections: List[ObjectDetection] = []
+    for query in normalized:
+        for detection in detector.predict(image_bgr, query):
+            detections.append(
+                ObjectDetection(
+                    bbox_xyxy=detection.bbox_xyxy,
+                    score=detection.score,
+                    query=detection.query or query,
+                )
+            )
+    return tuple(detections)
 
 
 def clamp_bbox_xyxy(
@@ -440,21 +582,47 @@ def create_masked_box_image(
     return masked, box
 
 
+def _bbox_iou(
+    first: Sequence[int],
+    second: Sequence[int],
+) -> float:
+    intersection_x1 = max(first[0], second[0])
+    intersection_y1 = max(first[1], second[1])
+    intersection_x2 = min(first[2], second[2])
+    intersection_y2 = min(first[3], second[3])
+    intersection = max(0, intersection_x2 - intersection_x1) * max(
+        0,
+        intersection_y2 - intersection_y1,
+    )
+    first_area = max(0, first[2] - first[0]) * max(
+        0,
+        first[3] - first[1],
+    )
+    second_area = max(0, second[2] - second[0]) * max(
+        0,
+        second[3] - second[1],
+    )
+    union = first_area + second_area - intersection
+    return float(intersection / union) if union > 0 else 0.0
+
+
 def rank_object_candidates(
     detections: Sequence[ObjectDetection],
     image_width: int,
     image_height: int,
     minimum_score: float,
     top_k: int,
+    duplicate_iou_threshold: float = 0.85,
 ) -> Tuple[RankedObjectCandidate, ...]:
-    """Filter, sort, clamp, and number the strongest VLPart proposals."""
+    """Merge alias duplicates, then rank proposals by alias support and score."""
 
     if not 0.0 <= minimum_score <= 1.0:
         raise ValueError("minimum_score must be between 0 and 1")
     if top_k <= 0:
         raise ValueError("top_k must be positive")
+    if not 0.0 <= duplicate_iou_threshold <= 1.0:
+        raise ValueError("duplicate_iou_threshold must be between 0 and 1")
 
-    ranked: List[RankedObjectCandidate] = []
     ordered = sorted(
         (
             detection
@@ -464,6 +632,7 @@ def rank_object_candidates(
         key=lambda detection: detection.score,
         reverse=True,
     )
+    merged: List[Dict[str, Any]] = []
     for detection in ordered:
         try:
             box = clamp_bbox_xyxy(
@@ -473,15 +642,53 @@ def rank_object_candidates(
             )
         except ObjectLocalizationError:
             continue
+        query = detection.query.strip()
+        duplicate = next(
+            (
+                candidate
+                for candidate in merged
+                if _bbox_iou(candidate["bbox_xyxy"], box)
+                >= duplicate_iou_threshold
+            ),
+            None,
+        )
+        if duplicate is not None:
+            if query and query.casefold() not in {
+                value.casefold() for value in duplicate["matched_queries"]
+            }:
+                duplicate["matched_queries"].append(query)
+            if detection.score > duplicate["vlpart_score"]:
+                duplicate["bbox_xyxy"] = box
+                duplicate["vlpart_score"] = float(detection.score)
+                duplicate["vlpart_query"] = query
+            continue
+        merged.append(
+            {
+                "bbox_xyxy": box,
+                "vlpart_score": float(detection.score),
+                "vlpart_query": query,
+                "matched_queries": [query] if query else [],
+            }
+        )
+
+    merged.sort(
+        key=lambda candidate: (
+            max(1, len(candidate["matched_queries"])),
+            candidate["vlpart_score"],
+        ),
+        reverse=True,
+    )
+    ranked: List[RankedObjectCandidate] = []
+    for candidate in merged[:top_k]:
         ranked.append(
             RankedObjectCandidate(
                 rank=len(ranked) + 1,
-                bbox_xyxy=box,
-                vlpart_score=float(detection.score),
+                bbox_xyxy=candidate["bbox_xyxy"],
+                vlpart_score=candidate["vlpart_score"],
+                vlpart_query=candidate["vlpart_query"],
+                matched_queries=tuple(candidate["matched_queries"]),
             )
         )
-        if len(ranked) == top_k:
-            break
     return tuple(ranked)
 
 
@@ -622,7 +829,11 @@ def create_candidate_board(
             color,
             3,
         )
-        label = f"#{candidate.rank}  VLPart {candidate.vlpart_score:.3f}"
+        alias_support = max(1, len(candidate.matched_queries))
+        label = (
+            f"#{candidate.rank} VLP {candidate.vlpart_score:.3f} "
+            f"A{alias_support}"
+        )
         cv2.putText(
             board,
             label,
@@ -769,6 +980,14 @@ class GeminiTopKObjectSelector:
                     "target_object": query,
                     "icar_context": safe_context,
                     "candidate_count": len(candidates),
+                    "candidate_alias_evidence": [
+                        {
+                            "rank": candidate.rank,
+                            "max_vlpart_score": candidate.vlpart_score,
+                            "matched_queries": list(candidate.matched_queries),
+                        }
+                        for candidate in candidates
+                    ],
                 },
                 ensure_ascii=False,
             )
@@ -898,6 +1117,7 @@ def localize_object_file(
     top_k: int = 10,
     selector: Optional[ObjectCandidateSelector] = None,
     selection_context: Optional[Dict[str, Any]] = None,
+    object_aliases: Sequence[str] = (),
 ) -> ObjectLocalizationResult:
     """Generate top-k proposals, choose one, and save M_BO plus audit files."""
 
@@ -915,9 +1135,10 @@ def localize_object_file(
         raise ValueError("top_k must be positive")
 
     query = _require_object_name(object_name)
+    query_aliases = build_object_query_aliases(query, object_aliases)
     height, width = image_bgr.shape[:2]
     candidates = rank_object_candidates(
-        detector.predict(image_bgr, query),
+        predict_object_aliases(detector, image_bgr, query_aliases),
         image_width=width,
         image_height=height,
         minimum_score=minimum_score,
@@ -926,7 +1147,7 @@ def localize_object_file(
     if not candidates:
         raise ObjectLocalizationError(
             f"VLPart found no {query!r} object candidate above score "
-            f"{minimum_score:.3f}"
+            f"{minimum_score:.3f}; tried aliases: {', '.join(query_aliases)}"
         )
 
     destination = Path(output_dir).expanduser().resolve()
@@ -942,7 +1163,9 @@ def localize_object_file(
         selection = ObjectCandidateSelection(
             selected_rank=1,
             confidence=float(candidates[0].vlpart_score),
-            reason="selected the highest raw VLPart score",
+            reason=(
+                "selected by alias support, then highest raw VLPart score"
+            ),
             method="vlpart-score",
             model="",
         )
@@ -989,6 +1212,7 @@ def localize_object_file(
 
     result = ObjectLocalizationResult(
         object_name=query,
+        query_aliases=query_aliases,
         bbox_xyxy=box,
         score=float(selected.vlpart_score),
         image_width=width,

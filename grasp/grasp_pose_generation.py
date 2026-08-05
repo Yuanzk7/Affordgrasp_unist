@@ -1,39 +1,32 @@
-"""Generate an affordance-steered AnyGrasp pose from the bundled D435 sample."""
+"""Generate a backend-neutral grasp pose from an affordance RGB-D sample."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
 
+from .backends import AnyGraspBackend, PcaBaselineBackend
+from .interfaces import (
+    GraspBackend,
+    GraspBackendError,
+    GraspCandidate,
+    GraspInput,
+    PreparedSample,
+)
+from .visualization import save_grasp_visualization, save_point_cloud_ply
+
 
 class GraspPoseGenerationError(RuntimeError):
-    """Raised when sample preparation or AnyGrasp inference cannot finish."""
+    """Raised when RGB-D preparation or grasp output cannot finish."""
 
 
-@dataclass(frozen=True)
-class PreparedSample:
-    points: np.ndarray
-    colors: np.ndarray
-    affordance_centroid: np.ndarray
-    image_width: int
-    image_height: int
-    valid_depth_pixels: int
-    affordance_pixels: int
-    mask_path: Path
-    overlay_path: Path
-
-
-# Two polygons cover the upper and lower handles of the pliers in sample_rgb.png.
+# Two polygons cover the upper and lower handles in the bundled pliers sample.
 _SAMPLE_PLIERS_HANDLE_POLYGONS: Tuple[Tuple[Tuple[int, int], ...], ...] = (
     (
         (285, 230),
@@ -91,16 +84,21 @@ def _load_images(rgb_path: Path, depth_path: Path) -> Tuple[np.ndarray, np.ndarr
         with Image.open(depth_path) as image:
             depth = np.asarray(image)
     except (OSError, ValueError) as exc:
-        raise GraspPoseGenerationError("could not read the sample RGB-D images") from exc
+        raise GraspPoseGenerationError(
+            "could not read the sample RGB-D images"
+        ) from exc
 
     if depth.ndim != 2 or not np.issubdtype(depth.dtype, np.integer):
-        raise GraspPoseGenerationError("sample depth must be a single-channel integer PNG")
+        raise GraspPoseGenerationError(
+            "sample depth must be a single-channel integer PNG"
+        )
     if depth.size == 0 or int(depth.max()) > np.iinfo(np.uint16).max:
         raise GraspPoseGenerationError("sample depth is not valid Z16 data")
     depth = depth.astype(np.uint16, copy=False)
     if rgb.shape[:2] != depth.shape:
         raise GraspPoseGenerationError(
-            f"RGB and depth dimensions differ: {rgb.shape[:2]} vs {depth.shape}"
+            "RGB and depth dimensions differ: "
+            f"{rgb.shape[:2]} vs {depth.shape}"
         )
     return rgb, depth
 
@@ -117,14 +115,37 @@ def _create_sample_affordance_mask(width: int, height: int) -> np.ndarray:
     return np.asarray(image, dtype=np.uint8) > 0
 
 
+def _load_affordance_mask(
+    mask_source: Optional[Path],
+    width: int,
+    height: int,
+) -> np.ndarray:
+    if mask_source is None:
+        return _create_sample_affordance_mask(width, height)
+    try:
+        with Image.open(mask_source) as image:
+            mask = np.asarray(image.convert("L"), dtype=np.uint8) > 0
+    except (OSError, ValueError) as exc:
+        raise GraspPoseGenerationError(
+            f"could not read affordance mask: {mask_source}"
+        ) from exc
+    if mask.shape != (height, width):
+        raise GraspPoseGenerationError(
+            f"affordance mask dimensions differ: {mask.shape} vs {(height, width)}"
+        )
+    if not np.any(mask):
+        raise GraspPoseGenerationError("affordance mask is empty")
+    return mask
+
+
 def _save_mask_outputs(
     rgb: np.ndarray,
     mask: np.ndarray,
     output_dir: Path,
 ) -> Tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    mask_path = output_dir / "manual_affordance_mask.png"
-    overlay_path = output_dir / "manual_affordance_overlay.png"
+    mask_path = output_dir / "affordance_mask_input.png"
+    overlay_path = output_dir / "affordance_overlay.png"
 
     Image.fromarray(mask.astype(np.uint8) * 255, mode="L").save(mask_path)
     overlay = rgb.astype(np.float32)
@@ -142,22 +163,48 @@ def prepare_sample(
     depth_source: str = "filtered",
     minimum_depth_m: float = 0.10,
     maximum_depth_m: float = 2.00,
+    mask_source: Optional[Path] = None,
+    rgb_source: Optional[Path] = None,
+    depth_image_source: Optional[Path] = None,
+    camera_source: Optional[Path] = None,
 ) -> PreparedSample:
-    """Build a camera-frame point cloud and pliers-handle steering mask."""
+    """Build the backend-neutral, affordance-filtered camera point cloud.
+
+    By default this reads the conventional filenames in ``sample_dir``. Passing
+    all three explicit RGB, depth and camera sources connects a real pipeline
+    run without renaming or copying its capture files.
+    """
 
     if depth_source not in {"raw", "filtered"}:
         raise ValueError("depth_source must be raw or filtered")
     if not 0.0 <= minimum_depth_m < maximum_depth_m:
         raise ValueError("depth range must satisfy 0 <= minimum < maximum")
 
-    sample_dir = sample_dir.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
-    rgb_path = sample_dir / "sample_rgb.png"
-    depth_path = sample_dir / f"sample_depth_{depth_source}.png"
-    camera_path = sample_dir / "sample_camera.json"
+    explicit_sources = (rgb_source, depth_image_source, camera_source)
+    if any(source is not None for source in explicit_sources) and not all(
+        source is not None for source in explicit_sources
+    ):
+        raise ValueError("explicit input requires --rgb, --depth and --camera together")
+    if rgb_source is not None:
+        assert depth_image_source is not None and camera_source is not None
+        rgb_path = rgb_source.expanduser().resolve()
+        depth_path = depth_image_source.expanduser().resolve()
+        camera_path = camera_source.expanduser().resolve()
+    else:
+        sample_dir = sample_dir.expanduser().resolve()
+        rgb_path = sample_dir / "sample_rgb.png"
+        depth_path = sample_dir / f"sample_depth_{depth_source}.png"
+        camera_path = sample_dir / "sample_camera.json"
     for path in (rgb_path, depth_path, camera_path):
         if not path.is_file():
             raise GraspPoseGenerationError(f"required sample file is missing: {path}")
+    if mask_source is not None:
+        mask_source = mask_source.expanduser().resolve()
+        if not mask_source.is_file():
+            raise GraspPoseGenerationError(
+                f"affordance mask does not exist: {mask_source}"
+            )
 
     rgb, depth = _load_images(rgb_path, depth_path)
     camera = _load_camera(camera_path)
@@ -178,7 +225,7 @@ def prepare_sample(
             "camera intrinsics dimensions do not match the sample depth image"
         )
 
-    affordance_mask = _create_sample_affordance_mask(width, height)
+    affordance_mask = _load_affordance_mask(mask_source, width, height)
     mask_path, overlay_path = _save_mask_outputs(rgb, affordance_mask, output_dir)
 
     z = depth.astype(np.float32) * np.float32(depth_scale)
@@ -195,21 +242,22 @@ def prepare_sample(
     affordance_points = point_image[affordance_valid]
     if len(affordance_points) == 0:
         raise GraspPoseGenerationError(
-            "the manual affordance mask contains no valid depth points"
+            "the affordance mask contains no valid depth points"
         )
 
-    # AffordGrasp Sec. III-C: filter the partial-view point cloud with the
-    # affordance mask, then give only that object-part cloud to AnyGrasp.
     points = affordance_points.astype(np.float32, copy=False)
     colors = (rgb[affordance_valid].astype(np.float32) / 255.0).astype(
         np.float32, copy=False
     )
     centroid = affordance_points.mean(axis=0, dtype=np.float64).astype(np.float32)
+    grasp_input = GraspInput(
+        points_xyz_m=points,
+        colors_rgb=colors,
+        affordance_centroid_xyz_m=centroid,
+    )
 
     return PreparedSample(
-        points=points,
-        colors=colors,
-        affordance_centroid=centroid,
+        grasp_input=grasp_input,
         image_width=width,
         image_height=height,
         valid_depth_pixels=int(np.count_nonzero(valid)),
@@ -219,141 +267,66 @@ def prepare_sample(
     )
 
 
-def _resolve_anygrasp_detection_dir(anygrasp_sdk: Optional[Path]) -> Optional[Path]:
-    if anygrasp_sdk is None:
-        return None
-
-    directory = anygrasp_sdk.expanduser().resolve()
-    if (directory / "grasp_detection").is_dir():
-        directory = directory / "grasp_detection"
-    if not directory.is_dir():
-        raise GraspPoseGenerationError(
-            f"AnyGrasp grasp_detection directory does not exist: {directory}"
-        )
-    return directory
-
-
-@contextmanager
-def _anygrasp_sdk_context(detection_dir: Optional[Path]):
-    if detection_dir is None:
-        yield
-        return
-
-    module_path = str(detection_dir)
-    previous_directory = Path.cwd()
-    sys.path.insert(0, module_path)
-    os.chdir(detection_dir)
-    try:
-        yield
-    finally:
-        os.chdir(previous_directory)
-        try:
-            sys.path.remove(module_path)
-        except ValueError:
-            pass
-
-
-def _run_anygrasp(
-    prepared: PreparedSample,
-    checkpoint_path: Optional[Path],
-    anygrasp_sdk: Optional[Path],
-    max_gripper_width: float,
-    gripper_height: float,
-) -> Tuple[Any, int, np.ndarray, np.ndarray]:
-    detection_dir = _resolve_anygrasp_detection_dir(anygrasp_sdk)
-    if checkpoint_path is None:
-        if detection_dir is None:
-            raise GraspPoseGenerationError(
-                "provide --checkpoint or --anygrasp-sdk"
-            )
-        checkpoint_path = detection_dir / "log" / "checkpoint_detection.tar"
-    checkpoint_path = checkpoint_path.expanduser().resolve()
-    if not checkpoint_path.is_file():
-        raise GraspPoseGenerationError(
-            f"AnyGrasp checkpoint does not exist: {checkpoint_path}"
-        )
-    if detection_dir is not None and not (detection_dir / "license").is_dir():
-        raise GraspPoseGenerationError(
-            f"AnyGrasp license directory does not exist: {detection_dir / 'license'}"
-        )
-    if not 0.0 < max_gripper_width <= 0.10:
-        raise ValueError("max_gripper_width must be in (0, 0.10]")
-    if gripper_height <= 0:
-        raise ValueError("gripper_height must be positive")
-
-    with _anygrasp_sdk_context(detection_dir):
-        try:
-            from gsnet import create_detector
-        except ImportError as exc:
-            raise GraspPoseGenerationError(
-                "AnyGrasp SDK is missing; install gsnet, its CUDA dependencies, "
-                "and complete AnyGrasp license registration"
-            ) from exc
-
-        config = SimpleNamespace(
-            checkpoint_path=str(checkpoint_path),
-            max_gripper_width=max_gripper_width,
-            gripper_height=gripper_height,
-        )
-        detector = create_detector(config)
-        if detector is None:
-            raise GraspPoseGenerationError(
-                "AnyGrasp detector initialization failed; verify checkpoint and license"
-            )
-
-        grasps = detector.get_grasp(prepared.points, {})
-    if grasps is None or len(grasps) == 0:
-        raise GraspPoseGenerationError(
-            "AnyGrasp produced no grasp from the affordance-filtered point cloud"
-        )
-
-    scores = np.asarray(grasps.scores, dtype=np.float64)
-    translations = np.asarray(grasps.translations, dtype=np.float64)
-    distances = np.linalg.norm(
-        translations - prepared.affordance_centroid.astype(np.float64),
-        axis=1,
+def _select_candidate(
+    candidates: Sequence[GraspCandidate],
+    centroid_xyz_m: np.ndarray,
+) -> Tuple[int, np.ndarray, np.ndarray]:
+    if not candidates:
+        raise GraspPoseGenerationError("grasp backend returned no candidates")
+    translations = np.stack(
+        [candidate.translation_xyz_m for candidate in candidates], axis=0
     )
-    with np.errstate(divide="ignore", invalid="ignore"):
-        paper_objective = np.where(distances == 0.0, np.inf, scores / distances)
-    selected_index = int(np.argmax(paper_objective))
-    return grasps, selected_index, distances, paper_objective
+    scores = np.asarray([candidate.score for candidate in candidates], dtype=np.float64)
+    distances = np.linalg.norm(
+        translations - centroid_xyz_m.astype(np.float64), axis=1
+    )
+    safe_distances = np.maximum(distances, 1e-6)
+    objectives = scores / safe_distances
+    return int(np.argmax(objectives)), distances, objectives
 
 
 def _write_result(
     output_dir: Path,
     prepared: PreparedSample,
-    grasps: Any,
+    candidates: Sequence[GraspCandidate],
     selected_index: int,
     distances: np.ndarray,
-    paper_objective: np.ndarray,
+    objectives: np.ndarray,
+    visualization_path: Path,
+    point_cloud_path: Path,
 ) -> Path:
-    rotations = np.asarray(grasps.rotation_matrices)
-    translations = np.asarray(grasps.translations)
-    widths = np.asarray(grasps.widths)
-    scores = np.asarray(grasps.scores)
-
-    rotation = rotations[selected_index]
-    translation = translations[selected_index]
+    selected = candidates[selected_index]
     payload = {
+        "backend": selected.backend,
         "coordinate_frame": "RealSense color camera: +x right, +y down, +z forward",
-        "selection_formula": "argmax(score(g) / ||t(g) - c||_2)",
-        "candidate_count": int(len(grasps)),
-        "affordance_centroid_xyz_m": prepared.affordance_centroid.tolist(),
+        "rotation_convention": (
+            "R columns are gripper approach, jaw-closing, remaining right-handed axis"
+        ),
+        "selection_formula": "argmax(score(g) / max(||t(g) - c||_2, 1e-6))",
+        "candidate_count": len(candidates),
+        "affordance_centroid_xyz_m": (
+            prepared.grasp_input.affordance_centroid_xyz_m.tolist()
+        ),
         "selected_candidate_index": selected_index,
         "selected_grasp": {
             "g": "[R, t, w]",
-            "score": float(scores[selected_index]),
+            "score": selected.score,
             "distance_to_affordance_centroid_m": float(distances[selected_index]),
-            "paper_objective": float(paper_objective[selected_index]),
-            "R": rotation.tolist(),
-            "t": translation.tolist(),
-            "w": float(widths[selected_index]),
+            "selection_objective": float(objectives[selected_index]),
+            "R": selected.rotation_matrix_camera.tolist(),
+            "t": selected.translation_xyz_m.tolist(),
+            "w": selected.width_m,
+            "metadata": dict(selected.metadata),
         },
         "inputs": {
             "partial_view_point_count": prepared.valid_depth_pixels,
-            "affordance_filtered_point_count": int(len(prepared.points)),
-            "manual_affordance_mask": str(prepared.mask_path),
-            "manual_affordance_overlay": str(prepared.overlay_path),
+            "affordance_filtered_point_count": len(prepared.grasp_input.points_xyz_m),
+            "affordance_mask": str(prepared.mask_path),
+            "affordance_overlay": str(prepared.overlay_path),
+        },
+        "visualization": {
+            "point_cloud_ply": str(point_cloud_path),
+            "grasp_pose_png": str(visualization_path),
         },
     }
     result_path = output_dir / "grasp_pose_result.json"
@@ -364,27 +337,24 @@ def _write_result(
     return result_path
 
 
-def _visualize(prepared: PreparedSample, grasps: Any, selected_index: int) -> None:
-    try:
-        import open3d as o3d
-    except ImportError as exc:
-        raise GraspPoseGenerationError(
-            "--vis requires the open3d package"
-        ) from exc
-
-    cloud = o3d.geometry.PointCloud()
-    cloud.points = o3d.utility.Vector3dVector(prepared.points)
-    cloud.colors = o3d.utility.Vector3dVector(prepared.colors)
-    grippers = grasps[selected_index : selected_index + 1].to_open3d_geometry_list()
-    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.10)
-    o3d.visualization.draw_geometries([cloud, frame, *grippers])
+def _create_backend(arguments: argparse.Namespace) -> GraspBackend:
+    if arguments.backend == "baseline":
+        return PcaBaselineBackend(
+            max_gripper_width_m=arguments.max_gripper_width,
+        )
+    return AnyGraspBackend(
+        checkpoint_path=arguments.checkpoint,
+        anygrasp_sdk=arguments.anygrasp_sdk,
+        max_gripper_width_m=arguments.max_gripper_width,
+        gripper_height_m=arguments.gripper_height,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Bundled D435 sample에서 수동 pliers-handle mask로 "
-            "AffordGrasp Sec. III-C의 grasp pose를 생성합니다."
+            "D435 RGB-D와 affordance mask에서 공통 grasp 입력을 생성하고 "
+            "baseline 또는 AnyGrasp 백엔드를 실행합니다."
         )
     )
     parser.add_argument(
@@ -402,59 +372,96 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("raw", "filtered"),
         default="filtered",
     )
+    parser.add_argument("--rgb", type=Path, help="실제 pipeline RGB PNG")
+    parser.add_argument("--depth", type=Path, help="실제 pipeline uint16 depth PNG")
+    parser.add_argument("--camera", type=Path, help="실제 pipeline camera JSON")
+    parser.add_argument(
+        "--mask",
+        type=Path,
+        help="외부 affordance mask PNG; 생략하면 번들 pliers 수동 mask 사용",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("baseline", "anygrasp"),
+        default="baseline",
+        help="라이선스 대기 중에는 baseline으로 전체 연결과 3D 출력을 검증",
+    )
     parser.add_argument("--checkpoint", type=Path, help="AnyGrasp checkpoint.tar")
     parser.add_argument(
         "--anygrasp-sdk",
         type=Path,
         help=(
-            "anygrasp_sdk 루트 또는 grasp_detection 경로; 지정하면 SDK import, "
-            "license/ 및 기본 log/checkpoint_detection.tar를 자동으로 사용"
+            "AnyGrasp SDK 루트 또는 grasp_detection 경로; AnyGrasp에서만 사용"
         ),
     )
     parser.add_argument(
         "--prepare-only",
         action="store_true",
-        help="mask와 point cloud 입력만 검증하고 AnyGrasp는 실행하지 않음",
+        help="mask와 point cloud 입력만 검증하고 grasp backend는 실행하지 않음",
     )
+    parser.add_argument("--min-depth", type=float, default=0.10)
+    parser.add_argument("--max-depth", type=float, default=2.00)
     parser.add_argument("--max-gripper-width", type=float, default=0.10)
     parser.add_argument("--gripper-height", type=float, default=0.03)
-    parser.add_argument("--vis", action="store_true", help="최종 grasp를 Open3D로 표시")
+    parser.add_argument(
+        "--max-vis-points",
+        type=int,
+        default=20_000,
+        help="3D PNG에 표시할 최대 point 수",
+    )
+    parser.add_argument(
+        "--vis",
+        action="store_true",
+        help="호환성 옵션; grasp 3D PNG는 추론 시 항상 저장됨",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
-    if (
-        not arguments.prepare_only
-        and arguments.checkpoint is None
-        and arguments.anygrasp_sdk is None
-    ):
-        parser.error(
-            "--checkpoint or --anygrasp-sdk is required unless --prepare-only is used"
-        )
-    if arguments.prepare_only and arguments.vis:
-        parser.error("--vis requires AnyGrasp inference")
+    if arguments.backend == "anygrasp" and not arguments.prepare_only:
+        if arguments.checkpoint is None and arguments.anygrasp_sdk is None:
+            parser.error("AnyGrasp requires --checkpoint or --anygrasp-sdk")
+    explicit_sources = (arguments.rgb, arguments.depth, arguments.camera)
+    if any(source is not None for source in explicit_sources):
+        if not all(source is not None for source in explicit_sources):
+            parser.error("explicit input requires --rgb, --depth and --camera together")
+        if arguments.mask is None:
+            parser.error("explicit RGB-D input requires --mask")
 
     try:
         output_dir = arguments.output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
         prepared = prepare_sample(
             sample_dir=arguments.sample_dir,
             output_dir=output_dir,
             depth_source=arguments.depth_source,
+            minimum_depth_m=arguments.min_depth,
+            maximum_depth_m=arguments.max_depth,
+            mask_source=arguments.mask,
+            rgb_source=arguments.rgb,
+            depth_image_source=arguments.depth,
+            camera_source=arguments.camera,
+        )
+        point_cloud_path = save_point_cloud_ply(
+            prepared.grasp_input,
+            output_dir / "affordance_point_cloud.ply",
         )
         if arguments.prepare_only:
             print(
                 json.dumps(
                     {
-                        "point_count": int(len(prepared.points)),
                         "partial_view_point_count": prepared.valid_depth_pixels,
-                        "affordance_filtered_point_count": int(len(prepared.points)),
-                        "affordance_centroid_xyz_m": (
-                            prepared.affordance_centroid.tolist()
+                        "affordance_filtered_point_count": len(
+                            prepared.grasp_input.points_xyz_m
                         ),
-                        "manual_affordance_mask": str(prepared.mask_path),
-                        "manual_affordance_overlay": str(prepared.overlay_path),
+                        "affordance_centroid_xyz_m": (
+                            prepared.grasp_input.affordance_centroid_xyz_m.tolist()
+                        ),
+                        "affordance_mask": str(prepared.mask_path),
+                        "affordance_overlay": str(prepared.overlay_path),
+                        "point_cloud_ply": str(point_cloud_path),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -462,26 +469,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 0
 
-        grasps, selected_index, distances, objective = _run_anygrasp(
-            prepared=prepared,
-            checkpoint_path=arguments.checkpoint,
-            anygrasp_sdk=arguments.anygrasp_sdk,
-            max_gripper_width=arguments.max_gripper_width,
-            gripper_height=arguments.gripper_height,
+        backend = _create_backend(arguments)
+        candidates = list(backend.generate(prepared.grasp_input))
+        selected_index, distances, objectives = _select_candidate(
+            candidates,
+            prepared.grasp_input.affordance_centroid_xyz_m,
+        )
+        visualization_path = save_grasp_visualization(
+            grasp_input=prepared.grasp_input,
+            candidate=candidates[selected_index],
+            output_path=output_dir / "grasp_pose_3d.png",
+            max_points=arguments.max_vis_points,
         )
         result_path = _write_result(
-            output_dir,
-            prepared,
-            grasps,
-            selected_index,
-            distances,
-            objective,
+            output_dir=output_dir,
+            prepared=prepared,
+            candidates=candidates,
+            selected_index=selected_index,
+            distances=distances,
+            objectives=objectives,
+            visualization_path=visualization_path,
+            point_cloud_path=point_cloud_path,
         )
-        print(result_path)
-        if arguments.vis:
-            _visualize(prepared, grasps, selected_index)
+        print(
+            json.dumps(
+                {
+                    "backend": backend.name,
+                    "result": str(result_path),
+                    "visualization": str(visualization_path),
+                    "point_cloud": str(point_cloud_path),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
-    except (GraspPoseGenerationError, OSError, ValueError) as exc:
+    except (
+        GraspBackendError,
+        GraspPoseGenerationError,
+        OSError,
+        ValueError,
+    ) as exc:
         print(f"Grasp Pose Generation 오류: {exc}", file=sys.stderr)
         return 2
 

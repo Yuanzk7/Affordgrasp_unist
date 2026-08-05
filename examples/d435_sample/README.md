@@ -29,3 +29,16 @@ depth_m = depth.astype(np.float32) * camera["depth_scale_meters_per_unit"]
 ```
 
 공개 저장소에 안전하게 포함할 수 있도록 원본 촬영 JSON의 카메라 시리얼 번호와 로컬 절대경로는 제거했습니다.
+
+프로젝트 루트에서 라이선스 없는 PCA baseline과 3D 시각화를 실행할 수 있습니다.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+python -m affordgrasp_icar.grasp.grasp_pose_generation \
+  --backend baseline \
+  --sample-dir examples/d435_sample \
+  --output-dir runs/grasp_baseline
+```
+
+`runs/grasp_baseline/grasp_pose_3d.png`는 정적 3D 확인 이미지이고,
+`affordance_point_cloud.ply`는 CloudCompare나 MeshLab 같은 PLY 뷰어에서 회전하며 확인할 수 있습니다.

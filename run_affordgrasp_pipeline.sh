@@ -9,6 +9,7 @@ usage() {
   단계 재실행: ./run_affordgrasp_pipeline.sh --stage icar "사용자 작업 지시" 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage localization 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage mask 촬영_prefix
+               ./run_affordgrasp_pipeline.sh --stage grasp 촬영_prefix
 
 --stage 재실행은 새로 촬영하지 않고 기존 captures/ 촬영본과
 runs/<prefix>/json 결과를 사용해 해당 단계만 다시 실행한다.
@@ -30,7 +31,7 @@ case $PIPELINE_STAGE in
     PIPELINE_INSTRUCTION=$1
     PIPELINE_PREFIX=$2
     ;;
-  localization | mask)
+  localization | mask | grasp)
     [[ $# -eq 1 ]] || usage
     PIPELINE_PREFIX=$1
     ;;
@@ -65,13 +66,41 @@ PIPELINE_DEVICE=${AFFORDGRASP_DEVICE:-cpu}
 PIPELINE_VLPART_ROOT=${AFFORDGRASP_VLPART_ROOT:-$PIPELINE_PROJECT_DIR/VLPart}
 PIPELINE_VLPART_WEIGHTS=${AFFORDGRASP_VLPART_WEIGHTS:-$PIPELINE_VLPART_ROOT/models/r50_pascalpart.pth}
 PIPELINE_VLPART_ENV=${AFFORDGRASP_VLPART_ENV:-$PIPELINE_VLPART_ROOT/.conda}
+PIPELINE_GRASP_BACKEND=${AFFORDGRASP_GRASP_BACKEND:-baseline}
+PIPELINE_GRASP_DEPTH_SOURCE=${AFFORDGRASP_GRASP_DEPTH_SOURCE:-filtered}
+PIPELINE_MAX_GRIPPER_WIDTH=${AFFORDGRASP_MAX_GRIPPER_WIDTH:-0.10}
+PIPELINE_GRIPPER_HEIGHT=${AFFORDGRASP_GRIPPER_HEIGHT:-0.03}
+PIPELINE_ANYGRASP_SDK=${AFFORDGRASP_ANYGRASP_SDK:-}
+PIPELINE_ANYGRASP_CHECKPOINT=${AFFORDGRASP_ANYGRASP_CHECKPOINT:-}
+PIPELINE_ANYGRASP_ENV=${AFFORDGRASP_ANYGRASP_ENV:-}
 
-PIPELINE_CAPTURE_DIR=$PIPELINE_PROJECT_DIR/captures/icar_d435
-PIPELINE_RUN_DIR=$PIPELINE_PROJECT_DIR/runs/$PIPELINE_PREFIX
+PIPELINE_CAPTURE_DIR=${AFFORDGRASP_CAPTURE_DIR:-$PIPELINE_PROJECT_DIR/captures/icar_d435}
+PIPELINE_RUN_ROOT=${AFFORDGRASP_RUN_ROOT:-$PIPELINE_PROJECT_DIR/runs}
+PIPELINE_RUN_DIR=$PIPELINE_RUN_ROOT/$PIPELINE_PREFIX
 PIPELINE_JSON_DIR=$PIPELINE_RUN_DIR/json
 PIPELINE_LOCALIZATION_DIR=$PIPELINE_RUN_DIR/object_localization
 PIPELINE_MASK_DIR=$PIPELINE_RUN_DIR/affordance_mask
+PIPELINE_GRASP_DIR=$PIPELINE_RUN_DIR/grasp
 PIPELINE_RGB_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_rgb.png
+PIPELINE_DEPTH_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_${PIPELINE_GRASP_DEPTH_SOURCE}.png
+PIPELINE_CAMERA_INFO=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_camera.json
+PIPELINE_AFFORDANCE_MASK=$PIPELINE_MASK_DIR/affordance_mask.png
+
+case $PIPELINE_GRASP_BACKEND in
+  baseline | anygrasp) ;;
+  *)
+    echo "AFFORDGRASP_GRASP_BACKEND는 baseline 또는 anygrasp이어야 합니다." >&2
+    exit 64
+    ;;
+esac
+
+case $PIPELINE_GRASP_DEPTH_SOURCE in
+  raw | filtered) ;;
+  *)
+    echo "AFFORDGRASP_GRASP_DEPTH_SOURCE는 raw 또는 filtered여야 합니다." >&2
+    exit 64
+    ;;
+esac
 
 require_file() {
   if [[ ! -f "$1" ]]; then
@@ -160,11 +189,59 @@ run_mask() {
     --device "$PIPELINE_DEVICE"
 }
 
+run_grasp() {
+  require_file "$PIPELINE_RGB_IMAGE" "촬영된 RGB 이미지가 없습니다"
+  require_file "$PIPELINE_DEPTH_IMAGE" "촬영된 depth 이미지가 없습니다"
+  require_file "$PIPELINE_CAMERA_INFO" "카메라 내부 파라미터 JSON이 없습니다"
+  require_file "$PIPELINE_AFFORDANCE_MASK" "Affordance mask가 없습니다"
+
+  local -a grasp_command=(
+    python -m affordgrasp_icar.grasp.grasp_pose_generation
+    --backend "$PIPELINE_GRASP_BACKEND"
+    --rgb "$PIPELINE_RGB_IMAGE"
+    --depth "$PIPELINE_DEPTH_IMAGE"
+    --camera "$PIPELINE_CAMERA_INFO"
+    --mask "$PIPELINE_AFFORDANCE_MASK"
+    --output-dir "$PIPELINE_GRASP_DIR"
+    --max-gripper-width "$PIPELINE_MAX_GRIPPER_WIDTH"
+    --gripper-height "$PIPELINE_GRIPPER_HEIGHT"
+  )
+
+  if [[ $PIPELINE_GRASP_BACKEND == "anygrasp" ]]; then
+    if [[ -z $PIPELINE_ANYGRASP_SDK && -z $PIPELINE_ANYGRASP_CHECKPOINT ]]; then
+      echo "AnyGrasp에는 AFFORDGRASP_ANYGRASP_SDK 또는 AFFORDGRASP_ANYGRASP_CHECKPOINT가 필요합니다." >&2
+      exit 2
+    fi
+    if [[ -n $PIPELINE_ANYGRASP_SDK ]]; then
+      grasp_command+=(--anygrasp-sdk "$PIPELINE_ANYGRASP_SDK")
+    fi
+    if [[ -n $PIPELINE_ANYGRASP_CHECKPOINT ]]; then
+      grasp_command+=(--checkpoint "$PIPELINE_ANYGRASP_CHECKPOINT")
+    fi
+  fi
+
+  if [[ -n $PIPELINE_ANYGRASP_ENV ]]; then
+    if ! command -v conda >/dev/null 2>&1; then
+      echo "conda 명령을 찾을 수 없습니다." >&2
+      exit 2
+    fi
+    if [[ ! -d $PIPELINE_ANYGRASP_ENV ]]; then
+      echo "Grasp Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
+      exit 2
+    fi
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+    conda run --prefix "$PIPELINE_ANYGRASP_ENV" "${grasp_command[@]}"
+  else
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. "${grasp_command[@]}"
+  fi
+}
+
 mkdir -p \
   "$PIPELINE_CAPTURE_DIR" \
   "$PIPELINE_JSON_DIR" \
   "$PIPELINE_LOCALIZATION_DIR" \
-  "$PIPELINE_MASK_DIR"
+  "$PIPELINE_MASK_DIR" \
+  "$PIPELINE_GRASP_DIR"
 
 case $PIPELINE_STAGE in
   all)
@@ -173,7 +250,8 @@ case $PIPELINE_STAGE in
     run_icar
     run_localization
     run_mask
-    printf 'AffordGrasp 실행 완료\n'
+    run_grasp
+    printf 'AffordGrasp 전체 실행 완료\n'
     printf 'RGB: %s\n' "$PIPELINE_RGB_IMAGE"
     printf 'Raw depth: %s\n' "$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_raw.png"
     printf 'Filtered depth: %s\n' "$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_filtered.png"
@@ -184,6 +262,10 @@ case $PIPELINE_STAGE in
     printf 'Masked object: %s\n' "$PIPELINE_LOCALIZATION_DIR/masked_object.png"
     printf 'Affordance mask: %s\n' "$PIPELINE_MASK_DIR/affordance_mask.png"
     printf 'Overlay: %s\n' "$PIPELINE_MASK_DIR/affordance_overlay.png"
+    printf 'Grasp backend: %s\n' "$PIPELINE_GRASP_BACKEND"
+    printf 'Grasp result: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
+    printf 'Grasp 3D: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
+    printf 'Grasp point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
     ;;
   icar)
     run_icar
@@ -201,5 +283,13 @@ case $PIPELINE_STAGE in
     printf 'Affordance Mask 재실행 완료\n'
     printf 'Affordance mask: %s\n' "$PIPELINE_MASK_DIR/affordance_mask.png"
     printf 'Overlay: %s\n' "$PIPELINE_MASK_DIR/affordance_overlay.png"
+    ;;
+  grasp)
+    run_grasp
+    printf 'Grasp Pose Generation 재실행 완료\n'
+    printf 'Backend: %s\n' "$PIPELINE_GRASP_BACKEND"
+    printf 'Result: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
+    printf '3D visualization: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
+    printf 'Point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
     ;;
 esac

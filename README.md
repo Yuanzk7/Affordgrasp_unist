@@ -5,10 +5,12 @@
 
 ```text
 D435 촬영 → ICAR (VLM 추론) → Object Localization (VLPart + Gemini top-k 재선택)
-→ Affordance Mask
+→ Affordance Mask → Grasp Backend (PCA baseline / AnyGrasp)
 ```
 
-AnyGrasp grasp 실행은 아직 메인 파이프라인에 없다 (`grasp/`는 번들 샘플 데모).
+`run_affordgrasp_pipeline.sh`는 촬영부터 Grasp Pose Generation과 3D 출력까지
+순서대로 실행한다. `grasp/`의 공통 인터페이스는 라이선스 없는 PCA baseline과
+AnyGrasp 어댑터를 같은 출력 형식으로 제공한다.
 
 ## 코드 구조
 
@@ -49,6 +51,65 @@ VLPart runtime 위치:
 ./run_affordgrasp_pipeline.sh --stage icar "새 지시" 01_pliers
 ./run_affordgrasp_pipeline.sh --stage localization 01_pliers
 ./run_affordgrasp_pipeline.sh --stage mask 01_pliers
+./run_affordgrasp_pipeline.sh --stage grasp 01_pliers
+```
+
+기본 grasp backend는 `baseline`이므로 AnyGrasp 라이선스 없이도 전체 실행된다.
+
+## Grasp 공통 인터페이스와 3D 시각화
+
+AnyGrasp 라이선스 없이 번들 D435 샘플로 입력·pose·3D 출력을 검증한다.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+python -m affordgrasp_icar.grasp.grasp_pose_generation \
+  --backend baseline \
+  --sample-dir examples/d435_sample \
+  --output-dir runs/grasp_baseline
+```
+
+출력은 `grasp_pose_result.json`, `grasp_pose_3d.png`,
+`affordance_point_cloud.ply`, mask와 overlay다. Baseline pose는 연결과
+시각화 검증 전용이며 실제 로봇에 실행하지 않는다.
+
+- 검은 선: parallel-jaw gripper
+- 빨간 축: 접근 방향
+- 초록 축: jaw closing 방향
+- 파란 축: 오른손 좌표계를 완성하는 gripper 축
+
+실제 파이프라인 산출물로 실행할 때는 네 입력을 명시한다.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+python -m affordgrasp_icar.grasp.grasp_pose_generation \
+  --backend baseline \
+  --rgb captures/icar_d435/<prefix>_rgb.png \
+  --depth captures/icar_d435/<prefix>_depth_filtered.png \
+  --camera captures/icar_d435/<prefix>_camera.json \
+  --mask runs/<prefix>/affordance_mask/affordance_mask.png \
+  --output-dir runs/<prefix>/grasp
+```
+
+라이선스와 checkpoint 준비 후 입력 경로는 그대로 두고 백엔드만 교체한다.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+python -m affordgrasp_icar.grasp.grasp_pose_generation \
+  --backend anygrasp \
+  --anygrasp-sdk /path/to/anygrasp_sdk \
+  --rgb captures/icar_d435/<prefix>_rgb.png \
+  --depth captures/icar_d435/<prefix>_depth_filtered.png \
+  --camera captures/icar_d435/<prefix>_camera.json \
+  --mask runs/<prefix>/affordance_mask/affordance_mask.png \
+  --output-dir runs/<prefix>/grasp
+```
+
+전체 파이프라인에서는 `config.env`만 변경하면 된다.
+
+```bash
+export AFFORDGRASP_GRASP_BACKEND=anygrasp
+export AFFORDGRASP_ANYGRASP_SDK=/path/to/anygrasp_sdk
+export AFFORDGRASP_ANYGRASP_ENV=/path/to/anygrasp/conda-env
 ```
 
 ## 설정
@@ -59,6 +120,10 @@ VLPart runtime 위치:
 
 - 대상이 `top_k_candidates.png`에 없으면 `AFFORDGRASP_OBJECT_TOP_K`를 15~20으로 올린다.
 - API 없이 실행할 때만 `AFFORDGRASP_SELECTION_METHOD=vlpart-score` (다물체 장면 비권장).
+- Object Localization은 `toilet paper`·`paper towel` 계열에 built-in alias
+  ensemble을 자동 적용하고, 동일 박스를 병합한 뒤 Gemini top-k로 넘긴다.
+- 다른 객체의 별칭은 Object Localization CLI에
+  `--object-alias "별칭"`을 여러 번 지정해 추가할 수 있다.
 
 ## 출력
 
@@ -67,7 +132,8 @@ captures/icar_d435/<prefix>_{rgb,depth_raw,depth_filtered,depth_preview}.png, <p
 runs/<prefix>/
 ├── json/                  capture·icar·grounding·localization·mask 결과 JSON
 ├── object_localization/   top_k_candidates.png, selected_object_overlay.png, masked_object.png
-└── affordance_mask/       affordance_mask.png, affordance_overlay.png
+├── affordance_mask/       affordance_mask.png, affordance_overlay.png
+└── grasp/                 grasp_pose_result.json, grasp_pose_3d.png, affordance_point_cloud.ply
 ```
 
 - 3D 계산에는 preview가 아닌 `depth_raw`/`depth_filtered`(`uint16`)와 `camera.json`을 사용한다.
@@ -82,4 +148,6 @@ runs/<prefix>/
 - `Gemini found no ... among top-k`: 후보 이미지 확인 후 `AFFORDGRASP_OBJECT_TOP_K` 상향
 - `Gemini top-k confidence ... below`: 대상이 선명하게 보이도록 재촬영
 - `found no part`: `part_name`이 이미지에서 실제로 보이는지 확인
+- `Affordance mask가 없습니다`: `--stage mask <prefix>`를 먼저 실행
+- AnyGrasp checkpoint/license 오류: `config.env`의 SDK·checkpoint·Conda 환경 확인
 - `num_batches_tracked` 경고: checkpoint 호환 경고로 추론이 완료됐다면 무시 가능
