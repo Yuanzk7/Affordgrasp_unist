@@ -15,6 +15,8 @@ venv/
 # Captured sensor data and generated results
 /captures/
 /runs/
+/calibration/
+/robot_config.json
 /gemini_result.json
 *.bag
 

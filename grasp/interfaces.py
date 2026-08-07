@@ -124,7 +124,7 @@ class GraspCandidate:
 
 
 class GraspBackend(Protocol):
-    """Interface implemented by the temporary baseline and AnyGrasp."""
+    """Interface implemented by grasp pose backends such as AnyGrasp."""
 
     @property
     def name(self) -> str:
@@ -143,5 +143,6 @@ class PreparedSample:
     image_height: int
     valid_depth_pixels: int
     affordance_pixels: int
+    camera_serial_number: str
     mask_path: Path
     overlay_path: Path

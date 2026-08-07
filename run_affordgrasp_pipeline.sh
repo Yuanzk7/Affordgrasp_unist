@@ -10,6 +10,8 @@ usage() {
                ./run_affordgrasp_pipeline.sh --stage localization 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage mask 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage grasp 촬영_prefix
+               ./run_affordgrasp_pipeline.sh --stage camera-sim 촬영_prefix
+               ./run_affordgrasp_pipeline.sh --stage robot-plan 촬영_prefix
 
 --stage 재실행은 새로 촬영하지 않고 기존 captures/ 촬영본과
 runs/<prefix>/json 결과를 사용해 해당 단계만 다시 실행한다.
@@ -31,7 +33,7 @@ case $PIPELINE_STAGE in
     PIPELINE_INSTRUCTION=$1
     PIPELINE_PREFIX=$2
     ;;
-  localization | mask | grasp)
+  localization | mask | grasp | camera-sim | robot-plan)
     [[ $# -eq 1 ]] || usage
     PIPELINE_PREFIX=$1
     ;;
@@ -66,13 +68,19 @@ PIPELINE_DEVICE=${AFFORDGRASP_DEVICE:-cpu}
 PIPELINE_VLPART_ROOT=${AFFORDGRASP_VLPART_ROOT:-$PIPELINE_PROJECT_DIR/VLPart}
 PIPELINE_VLPART_WEIGHTS=${AFFORDGRASP_VLPART_WEIGHTS:-$PIPELINE_VLPART_ROOT/models/r50_pascalpart.pth}
 PIPELINE_VLPART_ENV=${AFFORDGRASP_VLPART_ENV:-$PIPELINE_VLPART_ROOT/.conda}
-PIPELINE_GRASP_BACKEND=${AFFORDGRASP_GRASP_BACKEND:-anygrasp}
 PIPELINE_GRASP_DEPTH_SOURCE=${AFFORDGRASP_GRASP_DEPTH_SOURCE:-filtered}
 PIPELINE_MAX_GRIPPER_WIDTH=${AFFORDGRASP_MAX_GRIPPER_WIDTH:-0.10}
 PIPELINE_GRIPPER_HEIGHT=${AFFORDGRASP_GRIPPER_HEIGHT:-0.03}
 PIPELINE_ANYGRASP_SDK=${AFFORDGRASP_ANYGRASP_SDK:-}
 PIPELINE_ANYGRASP_CHECKPOINT=${AFFORDGRASP_ANYGRASP_CHECKPOINT:-}
 PIPELINE_ANYGRASP_ENV=${AFFORDGRASP_ANYGRASP_ENV:-}
+PIPELINE_OMP_NUM_THREADS=${AFFORDGRASP_OMP_NUM_THREADS:-16}
+PIPELINE_ROBOT_CONFIG=${AFFORDGRASP_ROBOT_CONFIG:-$PIPELINE_PROJECT_DIR/robot_config.json}
+PIPELINE_EYE_TO_HAND_CALIBRATION=${AFFORDGRASP_EYE_TO_HAND_CALIBRATION:-$PIPELINE_PROJECT_DIR/calibration/eye_to_hand.json}
+PIPELINE_SIM_PREGRASP_OFFSET=${AFFORDGRASP_SIM_PREGRASP_OFFSET:-0.12}
+PIPELINE_SIM_RETREAT_OFFSET=${AFFORDGRASP_SIM_RETREAT_OFFSET:-0.12}
+PIPELINE_SIM_LIFT_OFFSET=${AFFORDGRASP_SIM_LIFT_OFFSET:-0.08}
+PIPELINE_SIM_MAX_VIS_POINTS=${AFFORDGRASP_SIM_MAX_VIS_POINTS:-15000}
 
 PIPELINE_CAPTURE_DIR=${AFFORDGRASP_CAPTURE_DIR:-$PIPELINE_PROJECT_DIR/captures/icar_d435}
 PIPELINE_RUN_ROOT=${AFFORDGRASP_RUN_ROOT:-$PIPELINE_PROJECT_DIR/runs}
@@ -81,18 +89,12 @@ PIPELINE_JSON_DIR=$PIPELINE_RUN_DIR/json
 PIPELINE_LOCALIZATION_DIR=$PIPELINE_RUN_DIR/object_localization
 PIPELINE_MASK_DIR=$PIPELINE_RUN_DIR/affordance_mask
 PIPELINE_GRASP_DIR=$PIPELINE_RUN_DIR/grasp
+PIPELINE_CAMERA_SIM_DIR=$PIPELINE_RUN_DIR/camera_simulation
+PIPELINE_ROBOT_DIR=$PIPELINE_RUN_DIR/robot
 PIPELINE_RGB_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_rgb.png
 PIPELINE_DEPTH_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_${PIPELINE_GRASP_DEPTH_SOURCE}.png
 PIPELINE_CAMERA_INFO=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_camera.json
 PIPELINE_AFFORDANCE_MASK=$PIPELINE_MASK_DIR/affordance_mask.png
-
-case $PIPELINE_GRASP_BACKEND in
-  baseline | anygrasp) ;;
-  *)
-    echo "AFFORDGRASP_GRASP_BACKEND는 baseline 또는 anygrasp이어야 합니다." >&2
-    exit 64
-    ;;
-esac
 
 case $PIPELINE_GRASP_DEPTH_SOURCE in
   raw | filtered) ;;
@@ -195,9 +197,21 @@ run_grasp() {
   require_file "$PIPELINE_CAMERA_INFO" "카메라 내부 파라미터 JSON이 없습니다"
   require_file "$PIPELINE_AFFORDANCE_MASK" "Affordance mask가 없습니다"
 
+  if [[ -n $PIPELINE_ANYGRASP_SDK && ! -d $PIPELINE_ANYGRASP_SDK ]]; then
+    echo "AnyGrasp SDK 폴더가 없습니다: $PIPELINE_ANYGRASP_SDK" >&2
+    exit 2
+  fi
+  if [[ -n $PIPELINE_ANYGRASP_CHECKPOINT ]]; then
+    require_file "$PIPELINE_ANYGRASP_CHECKPOINT" \
+      "AnyGrasp checkpoint가 없습니다"
+  fi
+
+  local grasp_mpl_cache=$PIPELINE_GRASP_DIR/.matplotlib
+  local grasp_xdg_cache=$PIPELINE_GRASP_DIR/.cache
+  mkdir -p "$grasp_mpl_cache" "$grasp_xdg_cache"
+
   local -a grasp_command=(
     python -m affordgrasp_icar.grasp.grasp_pose_generation
-    --backend "$PIPELINE_GRASP_BACKEND"
     --rgb "$PIPELINE_RGB_IMAGE"
     --depth "$PIPELINE_DEPTH_IMAGE"
     --camera "$PIPELINE_CAMERA_INFO"
@@ -207,17 +221,15 @@ run_grasp() {
     --gripper-height "$PIPELINE_GRIPPER_HEIGHT"
   )
 
-  if [[ $PIPELINE_GRASP_BACKEND == "anygrasp" ]]; then
-    if [[ -z $PIPELINE_ANYGRASP_SDK && -z $PIPELINE_ANYGRASP_CHECKPOINT ]]; then
-      echo "AnyGrasp에는 AFFORDGRASP_ANYGRASP_SDK 또는 AFFORDGRASP_ANYGRASP_CHECKPOINT가 필요합니다." >&2
-      exit 2
-    fi
-    if [[ -n $PIPELINE_ANYGRASP_SDK ]]; then
-      grasp_command+=(--anygrasp-sdk "$PIPELINE_ANYGRASP_SDK")
-    fi
-    if [[ -n $PIPELINE_ANYGRASP_CHECKPOINT ]]; then
-      grasp_command+=(--checkpoint "$PIPELINE_ANYGRASP_CHECKPOINT")
-    fi
+  if [[ -z $PIPELINE_ANYGRASP_SDK && -z $PIPELINE_ANYGRASP_CHECKPOINT ]]; then
+    echo "AnyGrasp에는 AFFORDGRASP_ANYGRASP_SDK 또는 AFFORDGRASP_ANYGRASP_CHECKPOINT가 필요합니다." >&2
+    exit 2
+  fi
+  if [[ -n $PIPELINE_ANYGRASP_SDK ]]; then
+    grasp_command+=(--anygrasp-sdk "$PIPELINE_ANYGRASP_SDK")
+  fi
+  if [[ -n $PIPELINE_ANYGRASP_CHECKPOINT ]]; then
+    grasp_command+=(--checkpoint "$PIPELINE_ANYGRASP_CHECKPOINT")
   fi
 
   if [[ -n $PIPELINE_ANYGRASP_ENV ]]; then
@@ -229,11 +241,76 @@ run_grasp() {
       echo "Grasp Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
       exit 2
     fi
+    OMP_NUM_THREADS="$PIPELINE_OMP_NUM_THREADS" \
+    MPLCONFIGDIR="$grasp_mpl_cache" \
+    XDG_CACHE_HOME="$grasp_xdg_cache" \
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
     conda run --prefix "$PIPELINE_ANYGRASP_ENV" "${grasp_command[@]}"
   else
+    OMP_NUM_THREADS="$PIPELINE_OMP_NUM_THREADS" \
+    MPLCONFIGDIR="$grasp_mpl_cache" \
+    XDG_CACHE_HOME="$grasp_xdg_cache" \
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. "${grasp_command[@]}"
   fi
+}
+
+run_camera_sim() {
+  require_file "$PIPELINE_GRASP_DIR/grasp_pose_result.json" \
+    "Grasp Pose Generation 결과가 없습니다"
+
+  local sim_mpl_cache=$PIPELINE_CAMERA_SIM_DIR/.matplotlib
+  local sim_xdg_cache=$PIPELINE_CAMERA_SIM_DIR/.cache
+  mkdir -p "$sim_mpl_cache" "$sim_xdg_cache"
+  local -a simulation_command=(
+    python -m affordgrasp_icar.grasp.camera_simulation
+    --grasp-result "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
+    --output-dir "$PIPELINE_CAMERA_SIM_DIR"
+    --pregrasp-offset "$PIPELINE_SIM_PREGRASP_OFFSET"
+    --retreat-offset "$PIPELINE_SIM_RETREAT_OFFSET"
+    --lift-offset "$PIPELINE_SIM_LIFT_OFFSET"
+    --max-gripper-width "$PIPELINE_MAX_GRIPPER_WIDTH"
+    --max-vis-points "$PIPELINE_SIM_MAX_VIS_POINTS"
+  )
+
+  if [[ -n $PIPELINE_ANYGRASP_ENV ]]; then
+    if ! command -v conda >/dev/null 2>&1; then
+      echo "conda 명령을 찾을 수 없습니다." >&2
+      exit 2
+    fi
+    if [[ ! -d $PIPELINE_ANYGRASP_ENV ]]; then
+      echo "Camera simulation에 사용할 Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
+      exit 2
+    fi
+    MPLCONFIGDIR="$sim_mpl_cache" \
+    XDG_CACHE_HOME="$sim_xdg_cache" \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+    conda run --prefix "$PIPELINE_ANYGRASP_ENV" "${simulation_command[@]}"
+  else
+    MPLCONFIGDIR="$sim_mpl_cache" \
+    XDG_CACHE_HOME="$sim_xdg_cache" \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. "${simulation_command[@]}"
+  fi
+}
+
+run_robot_plan() {
+  require_file "$PIPELINE_GRASP_DIR/grasp_pose_result.json" \
+    "AnyGrasp 결과가 없습니다"
+  require_file "$PIPELINE_EYE_TO_HAND_CALIBRATION" \
+    "통과한 eye-to-hand 캘리브레이션이 없습니다"
+  require_file "$PIPELINE_ROBOT_CONFIG" \
+    "로봇 설정 파일이 없습니다"
+  if [[ -z $PIPELINE_ANYGRASP_ENV || ! -d $PIPELINE_ANYGRASP_ENV ]]; then
+    echo "Robot plan에 사용할 Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
+    exit 2
+  fi
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+  conda run --prefix "$PIPELINE_ANYGRASP_ENV" \
+  python -m affordgrasp_icar.robot.xarm_grasp_execution \
+    --grasp-result "$PIPELINE_GRASP_DIR/grasp_pose_result.json" \
+    --calibration "$PIPELINE_EYE_TO_HAND_CALIBRATION" \
+    --robot-config "$PIPELINE_ROBOT_CONFIG" \
+    --output "$PIPELINE_ROBOT_DIR/robot_plan.json" \
+    --mode plan
 }
 
 mkdir -p \
@@ -241,7 +318,9 @@ mkdir -p \
   "$PIPELINE_JSON_DIR" \
   "$PIPELINE_LOCALIZATION_DIR" \
   "$PIPELINE_MASK_DIR" \
-  "$PIPELINE_GRASP_DIR"
+  "$PIPELINE_GRASP_DIR" \
+  "$PIPELINE_CAMERA_SIM_DIR" \
+  "$PIPELINE_ROBOT_DIR"
 
 case $PIPELINE_STAGE in
   all)
@@ -251,6 +330,7 @@ case $PIPELINE_STAGE in
     run_localization
     run_mask
     run_grasp
+    run_camera_sim
     printf 'AffordGrasp 전체 실행 완료\n'
     printf 'RGB: %s\n' "$PIPELINE_RGB_IMAGE"
     printf 'Raw depth: %s\n' "$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_raw.png"
@@ -262,11 +342,14 @@ case $PIPELINE_STAGE in
     printf 'Masked object: %s\n' "$PIPELINE_LOCALIZATION_DIR/masked_object.png"
     printf 'Affordance mask: %s\n' "$PIPELINE_MASK_DIR/affordance_mask.png"
     printf 'Overlay: %s\n' "$PIPELINE_MASK_DIR/affordance_overlay.png"
-    printf 'Grasp backend: %s\n' "$PIPELINE_GRASP_BACKEND"
+    printf 'Grasp backend: anygrasp\n'
     printf 'Grasp result: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
     printf 'Grasp 3D: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
     printf 'Scene point cloud: %s\n' "$PIPELINE_GRASP_DIR/scene_point_cloud.ply"
     printf 'Affordance point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
+    printf 'Camera trajectory JSON: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.json"
+    printf 'Camera trajectory 3D: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory_3d.png"
+    printf 'Camera trajectory GIF: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.gif"
     ;;
   icar)
     run_icar
@@ -288,10 +371,24 @@ case $PIPELINE_STAGE in
   grasp)
     run_grasp
     printf 'Grasp Pose Generation 재실행 완료\n'
-    printf 'Backend: %s\n' "$PIPELINE_GRASP_BACKEND"
+    printf 'Backend: anygrasp\n'
     printf 'Result: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
     printf '3D visualization: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
     printf 'Scene point cloud: %s\n' "$PIPELINE_GRASP_DIR/scene_point_cloud.ply"
     printf 'Affordance point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
+    ;;
+  camera-sim)
+    run_camera_sim
+    printf '카메라 좌표계 grasp 경로 시뮬레이션 완료\n'
+    printf 'Trajectory: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.json"
+    printf '3D visualization: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory_3d.png"
+    printf 'Animation: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.gif"
+    printf '이 단계는 eye-to-hand 행렬이나 로봇 연결을 사용하지 않습니다.\n'
+    ;;
+  robot-plan)
+    run_robot_plan
+    printf 'xArm7 robot plan 생성 완료\n'
+    printf 'Plan: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan.json"
+    printf '이 단계는 로봇에 연결하거나 이동 명령을 보내지 않습니다.\n'
     ;;
 esac

@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .backends import AnyGraspBackend, PcaBaselineBackend
+from .backends import AnyGraspBackend
 from .interfaces import (
     GraspBackend,
     GraspBackendError,
@@ -268,6 +268,7 @@ def prepare_sample(
         image_height=height,
         valid_depth_pixels=int(np.count_nonzero(valid)),
         affordance_pixels=int(np.count_nonzero(affordance_region)),
+        camera_serial_number=str(camera.get("serial_number", "")),
         mask_path=mask_path,
         overlay_path=overlay_path,
     )
@@ -303,6 +304,24 @@ def _write_result(
     scene_point_cloud_path: Path,
 ) -> Path:
     selected = candidates[selected_index]
+
+    def candidate_payload(index: int, candidate: GraspCandidate) -> Dict[str, Any]:
+        distance = float(distances[index])
+        objective = float(objectives[index])
+        return {
+            "index": index,
+            "score": candidate.score,
+            "distance_to_affordance_centroid_m": distance,
+            "selection_objective": objective,
+            "R": candidate.rotation_matrix_camera.tolist(),
+            "t": candidate.translation_xyz_m.tolist(),
+            "w": candidate.width_m,
+            "gripper_tip_xyz_m": candidate.metadata.get(
+                "gripper_tip_xyz_m"
+            ),
+            "metadata": dict(candidate.metadata),
+        }
+
     payload = {
         "backend": selected.backend,
         "coordinate_frame": "RealSense color camera: +x right, +y down, +z forward",
@@ -317,18 +336,14 @@ def _write_result(
         "selected_candidate_index": selected_index,
         "selected_grasp": {
             "g": "[R, t, w]",
-            "score": selected.score,
-            "distance_to_affordance_centroid_m": float(distances[selected_index]),
-            "selection_objective": float(objectives[selected_index]),
-            "R": selected.rotation_matrix_camera.tolist(),
-            "t": selected.translation_xyz_m.tolist(),
-            "w": selected.width_m,
-            "gripper_tip_xyz_m": selected.metadata.get(
-                "gripper_tip_xyz_m"
-            ),
-            "metadata": dict(selected.metadata),
+            **candidate_payload(selected_index, selected),
         },
+        "candidates": [
+            candidate_payload(index, candidate)
+            for index, candidate in enumerate(candidates)
+        ],
         "inputs": {
+            "camera_serial_number": prepared.camera_serial_number,
             "partial_view_point_count": prepared.valid_depth_pixels,
             "scene_point_count": len(prepared.grasp_input.scene_points_xyz_m),
             "affordance_filtered_point_count": len(
@@ -355,10 +370,6 @@ def _write_result(
 
 
 def _create_backend(arguments: argparse.Namespace) -> GraspBackend:
-    if arguments.backend == "baseline":
-        return PcaBaselineBackend(
-            max_gripper_width_m=arguments.max_gripper_width,
-        )
     return AnyGraspBackend(
         checkpoint_path=arguments.checkpoint,
         anygrasp_sdk=arguments.anygrasp_sdk,
@@ -370,8 +381,8 @@ def _create_backend(arguments: argparse.Namespace) -> GraspBackend:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "D435 RGB-D와 affordance mask에서 공통 grasp 입력을 생성하고 "
-            "baseline 또는 AnyGrasp 백엔드를 실행합니다."
+            "D435 RGB-D와 affordance mask에서 grasp 입력을 생성하고 "
+            "AnyGrasp를 실행합니다."
         )
     )
     parser.add_argument(
@@ -396,12 +407,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--mask",
         type=Path,
         help="외부 affordance mask PNG; 생략하면 번들 pliers 수동 mask 사용",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=("baseline", "anygrasp"),
-        default="anygrasp",
-        help="기본값은 최신 AnyGrasp SDK; baseline은 기하 진단용",
     )
     parser.add_argument("--checkpoint", type=Path, help="AnyGrasp checkpoint.tar")
     parser.add_argument(
@@ -437,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
-    if arguments.backend == "anygrasp" and not arguments.prepare_only:
+    if not arguments.prepare_only:
         if arguments.checkpoint is None and arguments.anygrasp_sdk is None:
             parser.error("AnyGrasp requires --checkpoint or --anygrasp-sdk")
     explicit_sources = (arguments.rgb, arguments.depth, arguments.camera)
