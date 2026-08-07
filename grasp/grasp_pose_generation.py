@@ -19,7 +19,11 @@ from .interfaces import (
     GraspInput,
     PreparedSample,
 )
-from .visualization import save_grasp_visualization, save_point_cloud_ply
+from .visualization import (
+    save_grasp_visualization,
+    save_point_cloud_ply,
+    save_scene_point_cloud_ply,
+)
 
 
 class GraspPoseGenerationError(RuntimeError):
@@ -238,21 +242,23 @@ def prepare_sample(
     point_image = np.stack((x, y, z), axis=-1)
 
     valid = (z > minimum_depth_m) & (z < maximum_depth_m)
-    affordance_valid = valid & affordance_mask
-    affordance_points = point_image[affordance_valid]
+    scene_points = point_image[valid].astype(np.float32, copy=False)
+    scene_colors = (rgb[valid].astype(np.float32) / 255.0).astype(
+        np.float32,
+        copy=False,
+    )
+    affordance_region = np.ascontiguousarray(affordance_mask[valid], dtype=bool)
+    affordance_points = scene_points[affordance_region]
     if len(affordance_points) == 0:
         raise GraspPoseGenerationError(
             "the affordance mask contains no valid depth points"
         )
 
-    points = affordance_points.astype(np.float32, copy=False)
-    colors = (rgb[affordance_valid].astype(np.float32) / 255.0).astype(
-        np.float32, copy=False
-    )
     centroid = affordance_points.mean(axis=0, dtype=np.float64).astype(np.float32)
     grasp_input = GraspInput(
-        points_xyz_m=points,
-        colors_rgb=colors,
+        scene_points_xyz_m=scene_points,
+        scene_colors_rgb=scene_colors,
+        affordance_region_mask=affordance_region,
         affordance_centroid_xyz_m=centroid,
     )
 
@@ -261,7 +267,7 @@ def prepare_sample(
         image_width=width,
         image_height=height,
         valid_depth_pixels=int(np.count_nonzero(valid)),
-        affordance_pixels=int(np.count_nonzero(affordance_valid)),
+        affordance_pixels=int(np.count_nonzero(affordance_region)),
         mask_path=mask_path,
         overlay_path=overlay_path,
     )
@@ -293,7 +299,8 @@ def _write_result(
     distances: np.ndarray,
     objectives: np.ndarray,
     visualization_path: Path,
-    point_cloud_path: Path,
+    affordance_point_cloud_path: Path,
+    scene_point_cloud_path: Path,
 ) -> Path:
     selected = candidates[selected_index]
     payload = {
@@ -316,16 +323,26 @@ def _write_result(
             "R": selected.rotation_matrix_camera.tolist(),
             "t": selected.translation_xyz_m.tolist(),
             "w": selected.width_m,
+            "gripper_tip_xyz_m": selected.metadata.get(
+                "gripper_tip_xyz_m"
+            ),
             "metadata": dict(selected.metadata),
         },
         "inputs": {
             "partial_view_point_count": prepared.valid_depth_pixels,
-            "affordance_filtered_point_count": len(prepared.grasp_input.points_xyz_m),
+            "scene_point_count": len(prepared.grasp_input.scene_points_xyz_m),
+            "affordance_filtered_point_count": len(
+                prepared.grasp_input.affordance_points_xyz_m
+            ),
+            "affordance_region_fraction": float(
+                np.mean(prepared.grasp_input.affordance_region_mask)
+            ),
             "affordance_mask": str(prepared.mask_path),
             "affordance_overlay": str(prepared.overlay_path),
         },
         "visualization": {
-            "point_cloud_ply": str(point_cloud_path),
+            "scene_point_cloud_ply": str(scene_point_cloud_path),
+            "affordance_point_cloud_ply": str(affordance_point_cloud_path),
             "grasp_pose_png": str(visualization_path),
         },
     }
@@ -383,8 +400,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         choices=("baseline", "anygrasp"),
-        default="baseline",
-        help="라이선스 대기 중에는 baseline으로 전체 연결과 3D 출력을 검증",
+        default="anygrasp",
+        help="기본값은 최신 AnyGrasp SDK; baseline은 기하 진단용",
     )
     parser.add_argument("--checkpoint", type=Path, help="AnyGrasp checkpoint.tar")
     parser.add_argument(
@@ -444,24 +461,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             depth_image_source=arguments.depth,
             camera_source=arguments.camera,
         )
-        point_cloud_path = save_point_cloud_ply(
+        affordance_point_cloud_path = save_point_cloud_ply(
             prepared.grasp_input,
             output_dir / "affordance_point_cloud.ply",
+        )
+        scene_point_cloud_path = save_scene_point_cloud_ply(
+            prepared.grasp_input,
+            output_dir / "scene_point_cloud.ply",
         )
         if arguments.prepare_only:
             print(
                 json.dumps(
                     {
                         "partial_view_point_count": prepared.valid_depth_pixels,
+                        "scene_point_count": len(
+                            prepared.grasp_input.scene_points_xyz_m
+                        ),
                         "affordance_filtered_point_count": len(
-                            prepared.grasp_input.points_xyz_m
+                            prepared.grasp_input.affordance_points_xyz_m
                         ),
                         "affordance_centroid_xyz_m": (
                             prepared.grasp_input.affordance_centroid_xyz_m.tolist()
                         ),
                         "affordance_mask": str(prepared.mask_path),
                         "affordance_overlay": str(prepared.overlay_path),
-                        "point_cloud_ply": str(point_cloud_path),
+                        "scene_point_cloud_ply": str(scene_point_cloud_path),
+                        "affordance_point_cloud_ply": str(
+                            affordance_point_cloud_path
+                        ),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -489,7 +516,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             distances=distances,
             objectives=objectives,
             visualization_path=visualization_path,
-            point_cloud_path=point_cloud_path,
+            affordance_point_cloud_path=affordance_point_cloud_path,
+            scene_point_cloud_path=scene_point_cloud_path,
         )
         print(
             json.dumps(
@@ -497,7 +525,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "backend": backend.name,
                     "result": str(result_path),
                     "visualization": str(visualization_path),
-                    "point_cloud": str(point_cloud_path),
+                    "scene_point_cloud": str(scene_point_cloud_path),
+                    "affordance_point_cloud": str(
+                        affordance_point_cloud_path
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,

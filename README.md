@@ -5,12 +5,13 @@
 
 ```text
 D435 촬영 → ICAR (VLM 추론) → Object Localization (VLPart + Gemini top-k 재선택)
-→ Affordance Mask → Grasp Backend (PCA baseline / AnyGrasp)
+→ Affordance Mask → AnyGrasp (region steering + collision detection)
 ```
 
 `run_affordgrasp_pipeline.sh`는 촬영부터 Grasp Pose Generation과 3D 출력까지
-순서대로 실행한다. `grasp/`의 공통 인터페이스는 라이선스 없는 PCA baseline과
-AnyGrasp 어댑터를 같은 출력 형식으로 제공한다.
+순서대로 실행한다. `grasp/`는 전체 장면 포인트를 충돌 검사에 유지하고,
+affordance mask를 AnyGrasp의 `region_steering`으로 전달한다. PCA baseline은
+입력·시각화 진단용 fallback으로만 남겨 둔다.
 
 ## 코드 구조
 
@@ -54,7 +55,8 @@ VLPart runtime 위치:
 ./run_affordgrasp_pipeline.sh --stage grasp 01_pliers
 ```
 
-기본 grasp backend는 `baseline`이므로 AnyGrasp 라이선스 없이도 전체 실행된다.
+기본 grasp backend는 `anygrasp`다. SDK·라이선스·checkpoint·전용 Conda 환경은
+`config.env`에서 지정한다.
 
 ## Grasp 공통 인터페이스와 3D 시각화
 
@@ -68,9 +70,9 @@ python -m affordgrasp_icar.grasp.grasp_pose_generation \
   --output-dir runs/grasp_baseline
 ```
 
-출력은 `grasp_pose_result.json`, `grasp_pose_3d.png`,
-`affordance_point_cloud.ply`, mask와 overlay다. Baseline pose는 연결과
-시각화 검증 전용이며 실제 로봇에 실행하지 않는다.
+출력은 `grasp_pose_result.json`, `grasp_pose_3d.png`, 전체 충돌 문맥을 담은
+`scene_point_cloud.ply`, `affordance_point_cloud.ply`, mask와 overlay다.
+Baseline pose는 연결과 시각화 검증 전용이며 실제 로봇에 실행하지 않는다.
 
 - 검은 선: parallel-jaw gripper
 - 빨간 축: 접근 방향
@@ -82,21 +84,9 @@ python -m affordgrasp_icar.grasp.grasp_pose_generation \
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
 python -m affordgrasp_icar.grasp.grasp_pose_generation \
-  --backend baseline \
-  --rgb captures/icar_d435/<prefix>_rgb.png \
-  --depth captures/icar_d435/<prefix>_depth_filtered.png \
-  --camera captures/icar_d435/<prefix>_camera.json \
-  --mask runs/<prefix>/affordance_mask/affordance_mask.png \
-  --output-dir runs/<prefix>/grasp
-```
-
-라이선스와 checkpoint 준비 후 입력 경로는 그대로 두고 백엔드만 교체한다.
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
-python -m affordgrasp_icar.grasp.grasp_pose_generation \
   --backend anygrasp \
   --anygrasp-sdk /path/to/anygrasp_sdk \
+  --checkpoint /path/to/checkpoint_detection.tar \
   --rgb captures/icar_d435/<prefix>_rgb.png \
   --depth captures/icar_d435/<prefix>_depth_filtered.png \
   --camera captures/icar_d435/<prefix>_camera.json \
@@ -104,11 +94,16 @@ python -m affordgrasp_icar.grasp.grasp_pose_generation \
   --output-dir runs/<prefix>/grasp
 ```
 
-전체 파이프라인에서는 `config.env`만 변경하면 된다.
+AnyGrasp는 RGB 색 대신 전체 scene point cloud를 추론에 사용하고, mask와 같은
+길이의 3D region을 생성해 grasp 위치를 제한한다. 주변 물체 포인트는 삭제하지
+않으므로 collision detection에서 그대로 사용된다.
+
+전체 파이프라인에서는 `config.env`의 실제 경로를 사용한다.
 
 ```bash
 export AFFORDGRASP_GRASP_BACKEND=anygrasp
 export AFFORDGRASP_ANYGRASP_SDK=/path/to/anygrasp_sdk
+export AFFORDGRASP_ANYGRASP_CHECKPOINT=/path/to/checkpoint_detection.tar
 export AFFORDGRASP_ANYGRASP_ENV=/path/to/anygrasp/conda-env
 ```
 
@@ -133,7 +128,8 @@ runs/<prefix>/
 ├── json/                  capture·icar·grounding·localization·mask 결과 JSON
 ├── object_localization/   top_k_candidates.png, selected_object_overlay.png, masked_object.png
 ├── affordance_mask/       affordance_mask.png, affordance_overlay.png
-└── grasp/                 grasp_pose_result.json, grasp_pose_3d.png, affordance_point_cloud.ply
+└── grasp/                 grasp_pose_result.json, grasp_pose_3d.png,
+                          scene_point_cloud.ply, affordance_point_cloud.ply
 ```
 
 - 3D 계산에는 preview가 아닌 `depth_raw`/`depth_filtered`(`uint16`)와 `camera.json`을 사용한다.

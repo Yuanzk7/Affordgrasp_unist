@@ -15,33 +15,70 @@ class GraspBackendError(RuntimeError):
 
 @dataclass(frozen=True)
 class GraspInput:
-    """Affordance-filtered point cloud passed to every grasp backend.
+    """Scene point cloud plus the affordance region passed to grasp backends.
 
     Coordinates are metres in the aligned RealSense color-camera frame:
     +x right, +y down and +z forward. Colors are RGB floats in [0, 1].
+    ``affordance_region_mask`` maps element-for-element to the scene points.
     """
 
-    points_xyz_m: np.ndarray
-    colors_rgb: np.ndarray
+    scene_points_xyz_m: np.ndarray
+    scene_colors_rgb: np.ndarray
+    affordance_region_mask: np.ndarray
     affordance_centroid_xyz_m: np.ndarray
 
     def __post_init__(self) -> None:
-        points = np.asarray(self.points_xyz_m, dtype=np.float32)
-        colors = np.asarray(self.colors_rgb, dtype=np.float32)
+        points = np.ascontiguousarray(
+            self.scene_points_xyz_m,
+            dtype=np.float32,
+        )
+        colors = np.ascontiguousarray(
+            self.scene_colors_rgb,
+            dtype=np.float32,
+        )
+        region = np.ascontiguousarray(
+            self.affordance_region_mask,
+            dtype=bool,
+        )
         centroid = np.asarray(self.affordance_centroid_xyz_m, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
-            raise ValueError("points_xyz_m must have shape (N, 3) with N > 0")
+            raise ValueError(
+                "scene_points_xyz_m must have shape (N, 3) with N > 0"
+            )
         if colors.shape != points.shape:
-            raise ValueError("colors_rgb must have the same shape as points_xyz_m")
+            raise ValueError(
+                "scene_colors_rgb must have the same shape as scene_points_xyz_m"
+            )
+        if region.shape != (len(points),):
+            raise ValueError(
+                "affordance_region_mask must have shape (N,) matching scene points"
+            )
+        if not np.any(region):
+            raise ValueError("affordance_region_mask must select at least one point")
         if centroid.shape != (3,):
             raise ValueError("affordance_centroid_xyz_m must have shape (3,)")
         if not np.all(np.isfinite(points)) or not np.all(np.isfinite(centroid)):
             raise ValueError("grasp input contains non-finite coordinates")
         if not np.all(np.isfinite(colors)) or np.any(colors < 0) or np.any(colors > 1):
-            raise ValueError("colors_rgb must contain finite values in [0, 1]")
-        object.__setattr__(self, "points_xyz_m", points)
-        object.__setattr__(self, "colors_rgb", colors)
+            raise ValueError(
+                "scene_colors_rgb must contain finite values in [0, 1]"
+            )
+        object.__setattr__(self, "scene_points_xyz_m", points)
+        object.__setattr__(self, "scene_colors_rgb", colors)
+        object.__setattr__(self, "affordance_region_mask", region)
         object.__setattr__(self, "affordance_centroid_xyz_m", centroid)
+
+    @property
+    def affordance_points_xyz_m(self) -> np.ndarray:
+        """Return the scene points selected by the affordance region."""
+
+        return self.scene_points_xyz_m[self.affordance_region_mask]
+
+    @property
+    def affordance_colors_rgb(self) -> np.ndarray:
+        """Return RGB values for the affordance-selected scene points."""
+
+        return self.scene_colors_rgb[self.affordance_region_mask]
 
 
 @dataclass(frozen=True)

@@ -44,7 +44,10 @@ class PcaBaselineBackend:
         self.width_margin_m = float(width_margin_m)
 
     def generate(self, grasp_input: GraspInput) -> List[GraspCandidate]:
-        points = grasp_input.points_xyz_m.astype(np.float64, copy=False)
+        points = grasp_input.affordance_points_xyz_m.astype(
+            np.float64,
+            copy=False,
+        )
         if len(points) < 10:
             raise GraspBackendError(
                 "PCA baseline requires at least 10 affordance depth points"
@@ -180,58 +183,62 @@ class AnyGraspBackend:
 
     def _create_detector(self) -> Any:
         try:
-            from gsnet import AnyGrasp
-        except ImportError as exc:
+            from gsnet import create_detector
+        except Exception as exc:
             raise GraspBackendError(
                 "AnyGrasp SDK is missing; install gsnet and its CUDA "
-                "dependencies, then complete license registration"
+                "dependencies, then complete license registration: "
+                f"{exc}"
             ) from exc
 
         config = SimpleNamespace(
             checkpoint_path=str(self.checkpoint_path),
             max_gripper_width=self.max_gripper_width_m,
             gripper_height=self.gripper_height_m,
-            top_down_grasp=False,
-            debug=False,
         )
         try:
-            detector = AnyGrasp(config)
+            detector = create_detector(config)
             if detector is None:
-                raise RuntimeError("AnyGrasp returned no detector instance")
-            detector.load_net()
+                raise RuntimeError(
+                    "AnyGrasp returned no detector instance; license validation failed"
+                )
         except Exception as exc:
             raise GraspBackendError(
-                "AnyGrasp detector initialization failed; verify checkpoint and license"
+                "AnyGrasp detector initialization failed; verify checkpoint and "
+                f"license: {exc}"
             ) from exc
         return detector
 
     def generate(self, grasp_input: GraspInput) -> List[GraspCandidate]:
         with _anygrasp_sdk_context(self.detection_dir):
             detector = self._create_detector()
-            minimum = grasp_input.points_xyz_m.min(axis=0) - 0.02
-            maximum = grasp_input.points_xyz_m.max(axis=0) + 0.02
-            limits = [
-                float(minimum[0]),
-                float(maximum[0]),
-                float(minimum[1]),
-                float(maximum[1]),
-                max(0.0, float(minimum[2])),
-                float(maximum[2]),
-            ]
+            scene_points = np.ascontiguousarray(
+                grasp_input.scene_points_xyz_m,
+                dtype=np.float32,
+            )
+            affordance_region = np.ascontiguousarray(
+                grasp_input.affordance_region_mask,
+                dtype=bool,
+            )
+            inference_options = {
+                "dense_grasp": False,
+                "collision_detection": True,
+                "region_steering": affordance_region,
+                "approach_steering": None,
+                "approach_thresh": float(np.pi),
+            }
             try:
-                grasps, _ = detector.get_grasp(
-                    grasp_input.points_xyz_m,
-                    grasp_input.colors_rgb,
-                    lims=limits,
-                    apply_object_mask=False,
-                    dense_grasp=False,
-                    collision_detection=True,
+                grasps = detector.get_grasp(
+                    scene_points,
+                    inference_options,
                 )
             except Exception as exc:
-                raise GraspBackendError("AnyGrasp inference failed") from exc
+                raise GraspBackendError(
+                    f"AnyGrasp inference failed: {exc}"
+                ) from exc
         if grasps is None or len(grasps) == 0:
             raise GraspBackendError(
-                "AnyGrasp produced no grasp from the affordance-filtered point cloud"
+                "AnyGrasp produced no collision-free grasp in the affordance region"
             )
         grasps = grasps.nms().sort_by_score()
 
@@ -239,13 +246,27 @@ class AnyGraspBackend:
         translations = np.asarray(grasps.translations)
         widths = np.asarray(grasps.widths)
         scores = np.asarray(grasps.scores)
+        heights = np.asarray(grasps.heights)
+        depths = np.asarray(grasps.depths)
+        object_ids = np.asarray(grasps.object_ids)
         if not (
-            len(rotations) == len(translations) == len(widths) == len(scores)
+            len(rotations)
+            == len(translations)
+            == len(widths)
+            == len(scores)
+            == len(heights)
+            == len(depths)
+            == len(object_ids)
         ):
             raise GraspBackendError("AnyGrasp returned inconsistent candidate arrays")
 
         candidates: List[GraspCandidate] = []
         for index in range(len(grasps)):
+            insertion_depth = float(depths[index])
+            tip_xyz = (
+                translations[index]
+                + insertion_depth * rotations[index][:, 0]
+            )
             candidates.append(
                 GraspCandidate(
                     rotation_matrix_camera=rotations[index],
@@ -253,7 +274,16 @@ class AnyGraspBackend:
                     width_m=float(widths[index]),
                     score=float(scores[index]),
                     backend=self.name,
-                    metadata={"anygrasp_candidate_index": index},
+                    metadata={
+                        "anygrasp_candidate_index": index,
+                        "height_m": float(heights[index]),
+                        "insertion_depth_m": insertion_depth,
+                        "object_id": int(object_ids[index]),
+                        "gripper_tip_xyz_m": np.asarray(tip_xyz).tolist(),
+                        "region_steering": True,
+                        "collision_detection": True,
+                        "dense_grasp": False,
+                    },
                 )
             )
         return candidates

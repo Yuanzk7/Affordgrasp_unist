@@ -61,15 +61,32 @@ def save_grasp_visualization(
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
 
-    points = grasp_input.points_xyz_m
-    colors = grasp_input.colors_rgb
-    if len(points) > max_points:
-        indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
-        points_to_draw = points[indices]
-        colors_to_draw = colors[indices]
+    scene_points = grasp_input.scene_points_xyz_m
+    scene_colors = grasp_input.scene_colors_rgb
+    if len(scene_points) > max_points:
+        indices = np.linspace(
+            0,
+            len(scene_points) - 1,
+            max_points,
+            dtype=np.int64,
+        )
+        points_to_draw = scene_points[indices]
+        colors_to_draw = scene_colors[indices]
     else:
-        points_to_draw = points
-        colors_to_draw = colors
+        points_to_draw = scene_points
+        colors_to_draw = scene_colors
+
+    affordance_points = grasp_input.affordance_points_xyz_m
+    if len(affordance_points) > max_points:
+        affordance_indices = np.linspace(
+            0,
+            len(affordance_points) - 1,
+            max_points,
+            dtype=np.int64,
+        )
+        affordance_points_to_draw = affordance_points[affordance_indices]
+    else:
+        affordance_points_to_draw = affordance_points
 
     center = candidate.translation_xyz_m
     approach = candidate.rotation_matrix_camera[:, 0]
@@ -88,9 +105,20 @@ def save_grasp_visualization(
         points_to_draw[:, 1],
         points_to_draw[:, 2],
         c=colors_to_draw,
-        s=2,
-        alpha=0.65,
+        s=1.5,
+        alpha=0.25,
         depthshade=False,
+        label="visible scene",
+    )
+    axis.scatter(
+        affordance_points_to_draw[:, 0],
+        affordance_points_to_draw[:, 1],
+        affordance_points_to_draw[:, 2],
+        color="cyan",
+        s=3,
+        alpha=0.85,
+        depthshade=False,
+        label="affordance region",
     )
 
     gripper_style = {"color": "black", "linewidth": 4, "solid_capstyle": "round"}
@@ -98,6 +126,11 @@ def save_grasp_visualization(
     _draw_segment(axis, right_tip, right_back, **gripper_style)
     _draw_segment(axis, left_back, right_back, **gripper_style)
     axis.scatter(*center, color="magenta", s=45, label="grasp center")
+    gripper_tip = candidate.metadata.get("gripper_tip_xyz_m")
+    if gripper_tip is not None:
+        tip = np.asarray(gripper_tip, dtype=np.float64)
+        if tip.shape == (3,) and np.all(np.isfinite(tip)):
+            axis.scatter(*tip, color="orange", s=35, label="gripper tip")
 
     axis_length = max(0.025, min(candidate.width_m * 0.6, 0.05))
     for direction, color, label in (
@@ -119,7 +152,11 @@ def save_grasp_visualization(
             label=label,
         )
 
-    context_points = np.vstack((points_to_draw, left_back, right_back))
+    nearby = np.linalg.norm(points_to_draw - center, axis=1) <= 0.20
+    local_scene = points_to_draw[nearby]
+    if len(local_scene) == 0:
+        local_scene = affordance_points_to_draw
+    context_points = np.vstack((local_scene, left_back, right_back))
     _set_equal_3d_limits(axis, context_points)
     axis.set_xlabel("camera x (m, right)")
     axis.set_ylabel("camera y (m, down)")
@@ -135,16 +172,20 @@ def save_grasp_visualization(
     return output_path
 
 
-def save_point_cloud_ply(grasp_input: GraspInput, output_path: Path) -> Path:
-    """Write the affordance-filtered RGB point cloud as an ASCII PLY file."""
+def _save_rgb_point_cloud_ply(
+    points: np.ndarray,
+    colors: np.ndarray,
+    output_path: Path,
+) -> Path:
+    """Write one validated RGB point cloud as an ASCII PLY file."""
 
     output_path = output_path.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    rgb = np.rint(grasp_input.colors_rgb * 255.0).astype(np.uint8)
+    rgb = np.rint(colors * 255.0).astype(np.uint8)
     with output_path.open("w", encoding="ascii", newline="\n") as file:
         file.write("ply\n")
         file.write("format ascii 1.0\n")
-        file.write(f"element vertex {len(grasp_input.points_xyz_m)}\n")
+        file.write(f"element vertex {len(points)}\n")
         file.write("property float x\n")
         file.write("property float y\n")
         file.write("property float z\n")
@@ -152,9 +193,32 @@ def save_point_cloud_ply(grasp_input: GraspInput, output_path: Path) -> Path:
         file.write("property uchar green\n")
         file.write("property uchar blue\n")
         file.write("end_header\n")
-        for point, color in zip(grasp_input.points_xyz_m, rgb):
+        for point, color in zip(points, rgb):
             file.write(
                 f"{point[0]:.7g} {point[1]:.7g} {point[2]:.7g} "
                 f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
             )
     return output_path
+
+
+def save_point_cloud_ply(grasp_input: GraspInput, output_path: Path) -> Path:
+    """Write the affordance-filtered RGB point cloud as an ASCII PLY file."""
+
+    return _save_rgb_point_cloud_ply(
+        grasp_input.affordance_points_xyz_m,
+        grasp_input.affordance_colors_rgb,
+        output_path,
+    )
+
+
+def save_scene_point_cloud_ply(
+    grasp_input: GraspInput,
+    output_path: Path,
+) -> Path:
+    """Write the full valid-depth RGB scene used for collision checking."""
+
+    return _save_rgb_point_cloud_ply(
+        grasp_input.scene_points_xyz_m,
+        grasp_input.scene_colors_rgb,
+        output_path,
+    )

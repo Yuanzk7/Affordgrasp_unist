@@ -66,7 +66,7 @@ PIPELINE_DEVICE=${AFFORDGRASP_DEVICE:-cpu}
 PIPELINE_VLPART_ROOT=${AFFORDGRASP_VLPART_ROOT:-$PIPELINE_PROJECT_DIR/VLPart}
 PIPELINE_VLPART_WEIGHTS=${AFFORDGRASP_VLPART_WEIGHTS:-$PIPELINE_VLPART_ROOT/models/r50_pascalpart.pth}
 PIPELINE_VLPART_ENV=${AFFORDGRASP_VLPART_ENV:-$PIPELINE_VLPART_ROOT/.conda}
-PIPELINE_GRASP_BACKEND=${AFFORDGRASP_GRASP_BACKEND:-baseline}
+PIPELINE_GRASP_BACKEND=${AFFORDGRASP_GRASP_BACKEND:-anygrasp}
 PIPELINE_GRASP_DEPTH_SOURCE=${AFFORDGRASP_GRASP_DEPTH_SOURCE:-filtered}
 PIPELINE_MAX_GRIPPER_WIDTH=${AFFORDGRASP_MAX_GRIPPER_WIDTH:-0.10}
 PIPELINE_GRIPPER_HEIGHT=${AFFORDGRASP_GRIPPER_HEIGHT:-0.03}
@@ -265,7 +265,8 @@ case $PIPELINE_STAGE in
     printf 'Grasp backend: %s\n' "$PIPELINE_GRASP_BACKEND"
     printf 'Grasp result: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
     printf 'Grasp 3D: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
-    printf 'Grasp point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
+    printf 'Scene point cloud: %s\n' "$PIPELINE_GRASP_DIR/scene_point_cloud.ply"
+    printf 'Affordance point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
     ;;
   icar)
     run_icar
@@ -290,6 +291,7 @@ case $PIPELINE_STAGE in
     printf 'Backend: %s\n' "$PIPELINE_GRASP_BACKEND"
     printf 'Result: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
     printf '3D visualization: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
-    printf 'Point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
+    printf 'Scene point cloud: %s\n' "$PIPELINE_GRASP_DIR/scene_point_cloud.ply"
+    printf 'Affordance point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
     ;;
 esac
