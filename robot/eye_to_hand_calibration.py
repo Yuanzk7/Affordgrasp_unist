@@ -11,6 +11,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from ..camera import CameraCaptureError, capture_realsense
 from .transforms import (
@@ -52,11 +53,12 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 def _load_samples(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "calibration_type": "eye-to-hand",
+            "calibration_target": "charuco",
             "matrix_conventions": {
                 "robot_pose": "T_base_tcp",
-                "marker_pose": "T_camera_marker",
+                "target_pose": "T_camera_charuco_board",
             },
             "samples": [],
         }
@@ -68,6 +70,11 @@ def _load_samples(path: Path) -> Dict[str, Any]:
         raise CalibrationError("calibration sample JSON is malformed")
     if payload.get("calibration_type") != "eye-to-hand":
         raise CalibrationError("sample file is not eye-to-hand calibration data")
+    if payload.get("calibration_target") != "charuco":
+        raise CalibrationError(
+            "sample file is not ChArUco calibration data; do not mix old "
+            "single-ArUco samples with ChArUco samples"
+        )
     return payload
 
 
@@ -78,24 +85,101 @@ def _dictionary(name: str) -> Any:
     return cv2.aruco.getPredefinedDictionary(constant)
 
 
-def generate_marker(
-    output_path: Path,
-    marker_id: int,
+def _charuco_board(
+    squares_x: int,
+    squares_y: int,
+    square_length_m: float,
+    marker_length_m: float,
     dictionary_name: str,
-    pixels: int,
-) -> Path:
-    if marker_id < 0 or pixels < 200:
-        raise CalibrationError("marker id must be non-negative and pixels >= 200")
-    marker = cv2.aruco.generateImageMarker(
-        _dictionary(dictionary_name), marker_id, pixels
+) -> Any:
+    if squares_x < 3 or squares_y < 3:
+        raise CalibrationError("ChArUco board needs at least 3x3 squares")
+    if square_length_m <= 0.0 or marker_length_m <= 0.0:
+        raise CalibrationError("ChArUco square and marker lengths must be positive")
+    if marker_length_m >= square_length_m:
+        raise CalibrationError(
+            "ChArUco marker length must be smaller than square length"
+        )
+    try:
+        return cv2.aruco.CharucoBoard(
+            (squares_x, squares_y),
+            float(square_length_m),
+            float(marker_length_m),
+            _dictionary(dictionary_name),
+        )
+    except cv2.error as exc:
+        raise CalibrationError(f"could not create ChArUco board: {exc}") from exc
+
+
+def generate_charuco_board(
+    output_path: Path,
+    squares_x: int,
+    squares_y: int,
+    square_length_m: float,
+    marker_length_m: float,
+    dictionary_name: str,
+    pixels_per_square: int,
+    margin_pixels: int,
+) -> Dict[str, Any]:
+    if output_path.suffix.lower() != ".png":
+        raise CalibrationError("ChArUco board output must be a PNG file")
+    if pixels_per_square < 80:
+        raise CalibrationError("pixels per square must be at least 80")
+    if margin_pixels < 20:
+        raise CalibrationError("board margin must be at least 20 pixels")
+    board = _charuco_board(
+        squares_x,
+        squares_y,
+        square_length_m,
+        marker_length_m,
+        dictionary_name,
     )
-    border = max(20, pixels // 8)
-    page = np.full((pixels + 2 * border, pixels + 2 * border), 255, np.uint8)
-    page[border:-border, border:-border] = marker
+    width = squares_x * pixels_per_square + 2 * margin_pixels
+    height = squares_y * pixels_per_square + 2 * margin_pixels
+    image = board.generateImage(
+        (width, height),
+        marginSize=margin_pixels,
+        borderBits=1,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(output_path), page):
-        raise CalibrationError(f"could not save marker image: {output_path}")
-    return output_path
+    pixels_per_metre = pixels_per_square / square_length_m
+    print_dpi = pixels_per_metre * 0.0254
+    try:
+        Image.fromarray(image).save(
+            output_path,
+            format="PNG",
+            dpi=(print_dpi, print_dpi),
+        )
+    except OSError as exc:
+        raise CalibrationError(
+            f"could not save ChArUco board: {output_path}"
+        ) from exc
+    margin_length_m = margin_pixels / pixels_per_square * square_length_m
+    metadata = {
+        "target_type": "charuco",
+        "image": str(output_path),
+        "dictionary": dictionary_name,
+        "squares_x": squares_x,
+        "squares_y": squares_y,
+        "square_length_m": square_length_m,
+        "marker_length_m": marker_length_m,
+        "printed_pattern_width_m": squares_x * square_length_m,
+        "printed_pattern_height_m": squares_y * square_length_m,
+        "printed_page_width_m": squares_x * square_length_m + 2 * margin_length_m,
+        "printed_page_height_m": squares_y * square_length_m + 2 * margin_length_m,
+        "embedded_print_dpi": print_dpi,
+        "image_width_px": width,
+        "image_height_px": height,
+        "print_note": (
+            "Measure a chessboard square after printing and pass its actual "
+            "side length to --square-length-m. Print at actual size/100%, "
+            "disable fit-to-page, and keep the white margin."
+        ),
+    }
+    metadata_path = output_path.with_suffix(".json")
+    _write_json(metadata_path, metadata)
+    metadata["metadata"] = str(metadata_path)
+    return metadata
 
 
 def _camera_matrix(camera_payload: Mapping[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
@@ -117,53 +201,105 @@ def _camera_matrix(camera_payload: Mapping[str, Any]) -> Tuple[np.ndarray, np.nd
     return camera_matrix, coefficients
 
 
-def _detect_marker_pose(
+def _detect_charuco_pose(
     image: np.ndarray,
     camera_matrix: np.ndarray,
     distortion: np.ndarray,
-    marker_id: int,
+    squares_x: int,
+    squares_y: int,
+    square_length_m: float,
     marker_length_m: float,
     dictionary_name: str,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    detector = cv2.aruco.ArucoDetector(
-        _dictionary(dictionary_name), cv2.aruco.DetectorParameters()
+    minimum_corners: int,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    Sequence[np.ndarray],
+    np.ndarray,
+    float,
+]:
+    board = _charuco_board(
+        squares_x,
+        squares_y,
+        square_length_m,
+        marker_length_m,
+        dictionary_name,
     )
-    corners, ids, _ = detector.detectMarkers(image)
-    if ids is None:
-        raise CalibrationError("ArUco marker was not detected")
-    matches = np.flatnonzero(ids.reshape(-1) == marker_id)
-    if len(matches) != 1:
+    available_corners = (squares_x - 1) * (squares_y - 1)
+    if minimum_corners < 4 or minimum_corners > available_corners:
         raise CalibrationError(
-            f"expected exactly one marker id {marker_id}, found {len(matches)}"
+            "minimum ChArUco corners must be between 4 and "
+            f"{available_corners} for this board"
         )
-    image_points = np.asarray(corners[int(matches[0])], dtype=np.float64).reshape(4, 2)
-    half = marker_length_m / 2.0
-    object_points = np.array(
-        [
-            [-half, half, 0.0],
-            [half, half, 0.0],
-            [half, -half, 0.0],
-            [-half, -half, 0.0],
-        ],
-        dtype=np.float64,
+    charuco_parameters = cv2.aruco.CharucoParameters()
+    charuco_parameters.cameraMatrix = camera_matrix
+    charuco_parameters.distCoeffs = distortion
+    charuco_parameters.minMarkers = 2
+    charuco_parameters.tryRefineMarkers = True
+    detector_parameters = cv2.aruco.DetectorParameters()
+    detector_parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    detector = cv2.aruco.CharucoDetector(
+        board,
+        charuco_parameters,
+        detector_parameters,
     )
+    charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(
+        image
+    )
+    marker_count = 0 if marker_ids is None else len(marker_ids)
+    if marker_count == 0:
+        raise CalibrationError("no ArUco markers from the ChArUco board were detected")
+    corner_count = 0 if charuco_ids is None else len(charuco_ids)
+    if corner_count < minimum_corners:
+        raise CalibrationError(
+            f"only {corner_count} ChArUco corners were detected; "
+            f"at least {minimum_corners} are required"
+        )
+    if board.checkCharucoCornersCollinear(charuco_ids):
+        raise CalibrationError("detected ChArUco corners are collinear")
+    object_points, image_points = board.matchImagePoints(
+        charuco_corners, charuco_ids
+    )
+    object_points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
+    image_points = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
     success, rvec, tvec = cv2.solvePnP(
         object_points,
         image_points,
         camera_matrix,
         distortion,
-        flags=cv2.SOLVEPNP_IPPE_SQUARE,
+        flags=cv2.SOLVEPNP_ITERATIVE,
     )
     if not success or float(tvec.reshape(3)[2]) <= 0.0:
-        raise CalibrationError("could not estimate a positive-depth marker pose")
+        raise CalibrationError("could not estimate a positive-depth ChArUco pose")
+    if hasattr(cv2, "solvePnPRefineLM"):
+        rvec, tvec = cv2.solvePnPRefineLM(
+            object_points,
+            image_points,
+            camera_matrix,
+            distortion,
+            rvec,
+            tvec,
+        )
     projected, _ = cv2.projectPoints(
         object_points, rvec, tvec, camera_matrix, distortion
     )
     reprojection = float(
-        np.sqrt(np.mean(np.sum((projected.reshape(4, 2) - image_points) ** 2, axis=1)))
+        np.sqrt(
+            np.mean(
+                np.sum((projected.reshape(-1, 2) - image_points) ** 2, axis=1)
+            )
+        )
     )
     transform = make_transform(cv2.Rodrigues(rvec)[0], tvec.reshape(3))
-    return transform, image_points, reprojection
+    return (
+        transform,
+        charuco_corners,
+        charuco_ids,
+        marker_corners,
+        marker_ids,
+        reprojection,
+    )
 
 
 def _read_robot_pose(arm: Any) -> np.ndarray:
@@ -182,12 +318,28 @@ def _connect_robot(robot_ip: str) -> Any:
 
 
 def capture_sample(arguments: argparse.Namespace) -> Dict[str, Any]:
-    if arguments.marker_length_m <= 0.0:
-        raise CalibrationError("marker length must be positive")
+    board_metadata = {
+        "target_type": "charuco",
+        "dictionary": arguments.dictionary,
+        "squares_x": arguments.squares_x,
+        "squares_y": arguments.squares_y,
+        "square_length_m": arguments.square_length_m,
+        "marker_length_m": arguments.marker_length_m,
+    }
+    _charuco_board(
+        arguments.squares_x,
+        arguments.squares_y,
+        arguments.square_length_m,
+        arguments.marker_length_m,
+        arguments.dictionary,
+    )
     sample_file = arguments.samples.expanduser().resolve()
     payload = _load_samples(sample_file)
     samples = payload["samples"]
-    index = len(samples) + 1
+    # Curated calibration files can contain sparse original capture indices.
+    # Continue after the largest one so a later capture never overwrites a
+    # retained image or creates a duplicate sample index.
+    index = max((int(sample["index"]) for sample in samples), default=0) + 1
     output_dir = arguments.image_dir.expanduser().resolve()
     prefix = f"calib_{index:03d}"
 
@@ -241,38 +393,48 @@ def capture_sample(arguments: argparse.Namespace) -> Dict[str, Any]:
     if image is None:
         raise CalibrationError(f"could not read captured RGB: {capture.rgb_path}")
     camera_matrix, distortion = _camera_matrix(camera_payload)
-    camera_to_marker, image_points, reprojection = _detect_marker_pose(
+    (
+        camera_to_board,
+        charuco_corners,
+        charuco_ids,
+        marker_corners,
+        marker_ids,
+        reprojection,
+    ) = _detect_charuco_pose(
         image,
         camera_matrix,
         distortion,
-        arguments.marker_id,
+        arguments.squares_x,
+        arguments.squares_y,
+        arguments.square_length_m,
         arguments.marker_length_m,
         arguments.dictionary,
+        arguments.min_charuco_corners,
     )
     if reprojection > arguments.max_reprojection_error_px:
         raise CalibrationError(
-            f"marker reprojection error is too high: {reprojection:.2f} px"
+            f"ChArUco reprojection error is too high: {reprojection:.2f} px"
         )
 
     overlay = image.copy()
-    cv2.polylines(
+    cv2.aruco.drawDetectedMarkers(overlay, marker_corners, marker_ids)
+    cv2.aruco.drawDetectedCornersCharuco(
         overlay,
-        [np.round(image_points).astype(np.int32)],
-        True,
+        charuco_corners,
+        charuco_ids,
         (0, 255, 0),
-        2,
     )
     cv2.drawFrameAxes(
         overlay,
         camera_matrix,
         distortion,
-        cv2.Rodrigues(camera_to_marker[:3, :3])[0],
-        camera_to_marker[:3, 3],
-        arguments.marker_length_m * 0.5,
+        cv2.Rodrigues(camera_to_board[:3, :3])[0],
+        camera_to_board[:3, 3],
+        arguments.square_length_m * 2.0,
     )
-    overlay_path = output_dir / f"{prefix}_marker_overlay.png"
+    overlay_path = output_dir / f"{prefix}_charuco_overlay.png"
     if not cv2.imwrite(str(overlay_path), overlay):
-        raise CalibrationError(f"could not save marker overlay: {overlay_path}")
+        raise CalibrationError(f"could not save ChArUco overlay: {overlay_path}")
 
     serial = str(camera_payload.get("serial_number", ""))
     existing_serial = payload.get("camera_serial_number")
@@ -287,6 +449,11 @@ def capture_sample(arguments: argparse.Namespace) -> Dict[str, Any]:
         atol=arguments.tcp_offset_tolerance_mm,
     ):
         raise CalibrationError("xArm TCP offset changed between calibration samples")
+    existing_board = payload.get("charuco_board")
+    if existing_board is not None and existing_board != board_metadata:
+        raise CalibrationError(
+            "ChArUco board settings changed between calibration samples"
+        )
     payload.update(
         {
             "robot_model": "xArm7",
@@ -294,11 +461,7 @@ def capture_sample(arguments: argparse.Namespace) -> Dict[str, Any]:
             "camera_model": str(camera_payload.get("camera_name", "D435")),
             "camera_serial_number": serial,
             "tcp_offset_mm_rad": current_tcp_offset.tolist(),
-            "marker": {
-                "dictionary": arguments.dictionary,
-                "id": arguments.marker_id,
-                "black_square_length_m": arguments.marker_length_m,
-            },
+            "charuco_board": board_metadata,
             "updated_at": _utc_now(),
         }
     )
@@ -306,12 +469,14 @@ def capture_sample(arguments: argparse.Namespace) -> Dict[str, Any]:
         "index": index,
         "captured_at": _utc_now(),
         "T_base_tcp": base_to_tcp.tolist(),
-        "T_camera_marker": camera_to_marker.tolist(),
-        "marker_reprojection_error_px": reprojection,
+        "T_camera_charuco_board": camera_to_board.tolist(),
+        "charuco_corner_count": int(len(charuco_ids)),
+        "aruco_marker_count": int(len(marker_ids)),
+        "charuco_reprojection_error_px": reprojection,
         "robot_motion_during_capture_m": translation_motion,
         "robot_rotation_during_capture_deg": float(np.rad2deg(rotation_motion)),
         "rgb_path": str(capture.rgb_path),
-        "marker_overlay_path": str(overlay_path),
+        "charuco_overlay_path": str(overlay_path),
         "camera_info_path": str(capture.camera_info_path),
     }
     samples.append(sample)
@@ -346,26 +511,26 @@ def read_robot_status(robot_ip: str) -> Dict[str, Any]:
 def _pairwise_quality(
     base_to_camera: np.ndarray,
     base_to_tcp: Sequence[np.ndarray],
-    camera_to_marker: Sequence[np.ndarray],
+    camera_to_board: Sequence[np.ndarray],
 ) -> Dict[str, float]:
-    tcp_to_marker = [
-        invert_transform(robot_pose) @ base_to_camera @ marker_pose
-        for robot_pose, marker_pose in zip(base_to_tcp, camera_to_marker)
+    tcp_to_board = [
+        invert_transform(robot_pose) @ base_to_camera @ board_pose
+        for robot_pose, board_pose in zip(base_to_tcp, camera_to_board)
     ]
     translation_errors = []
     rotation_errors = []
-    for left in range(len(tcp_to_marker)):
-        for right in range(left + 1, len(tcp_to_marker)):
+    for left in range(len(tcp_to_board)):
+        for right in range(left + 1, len(tcp_to_board)):
             translation_errors.append(
                 float(
                     np.linalg.norm(
-                        tcp_to_marker[left][:3, 3] - tcp_to_marker[right][:3, 3]
+                        tcp_to_board[left][:3, 3] - tcp_to_board[right][:3, 3]
                     )
                 )
             )
             rotation_errors.append(
                 rotation_distance_rad(
-                    tcp_to_marker[left][:3, :3], tcp_to_marker[right][:3, :3]
+                    tcp_to_board[left][:3, :3], tcp_to_board[right][:3, :3]
                 )
             )
     translation_array = np.asarray(translation_errors, dtype=np.float64)
@@ -415,8 +580,10 @@ def solve_calibration(arguments: argparse.Namespace) -> Dict[str, Any]:
         validate_transform(np.asarray(sample["T_base_tcp"], dtype=np.float64))
         for sample in samples
     ]
-    camera_to_marker = [
-        validate_transform(np.asarray(sample["T_camera_marker"], dtype=np.float64))
+    camera_to_board = [
+        validate_transform(
+            np.asarray(sample["T_camera_charuco_board"], dtype=np.float64)
+        )
         for sample in samples
     ]
     diversity = _sample_diversity(base_to_tcp)
@@ -441,13 +608,13 @@ def solve_calibration(arguments: argparse.Namespace) -> Dict[str, Any]:
             rotation, translation = cv2.calibrateHandEye(
                 [pose[:3, :3] for pose in tcp_to_base],
                 [pose[:3, 3] for pose in tcp_to_base],
-                [pose[:3, :3] for pose in camera_to_marker],
-                [pose[:3, 3] for pose in camera_to_marker],
+                [pose[:3, :3] for pose in camera_to_board],
+                [pose[:3, 3] for pose in camera_to_board],
                 method=method,
             )
             base_to_camera = make_transform(rotation, np.asarray(translation).reshape(3))
             quality = _pairwise_quality(
-                base_to_camera, base_to_tcp, camera_to_marker
+                base_to_camera, base_to_tcp, camera_to_board
             )
             score = (
                 quality["pairwise_translation_rms_m"]
@@ -469,7 +636,7 @@ def solve_calibration(arguments: argparse.Namespace) -> Dict[str, Any]:
         and diversity_passed
     )
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "calibration_type": "eye-to-hand",
         "matrix_convention": "p_base = T_base_camera @ p_camera",
         "T_base_camera": base_to_camera.tolist(),
@@ -484,7 +651,7 @@ def solve_calibration(arguments: argparse.Namespace) -> Dict[str, Any]:
             "serial_number": payload.get("camera_serial_number"),
             "frame": "RealSense color optical frame",
         },
-        "marker": payload.get("marker"),
+        "calibration_target": payload.get("charuco_board"),
         "method": method_name,
         "sample_count": len(samples),
         "diversity": {**diversity, "passed": diversity_passed},
@@ -509,19 +676,28 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status")
     status.add_argument("--robot-ip", default="192.168.1.216")
 
-    marker = subparsers.add_parser("generate-marker")
-    marker.add_argument("--output", type=Path, required=True)
-    marker.add_argument("--marker-id", type=int, default=0)
-    marker.add_argument("--dictionary", default="DICT_4X4_50")
-    marker.add_argument("--pixels", type=int, default=1200)
+    board = subparsers.add_parser("generate-board")
+    board.add_argument("--output", type=Path, required=True)
+    board.add_argument("--squares-x", type=int, default=4)
+    board.add_argument("--squares-y", type=int, default=5)
+    board.add_argument("--square-length-m", type=float, default=0.030)
+    board.add_argument("--marker-length-m", type=float, default=0.022)
+    board.add_argument("--dictionary", default="DICT_4X4_50")
+    board.add_argument("--pixels-per-square", type=int, default=300)
+    board.add_argument("--margin-pixels", type=int, default=100)
 
     capture = subparsers.add_parser("capture")
     capture.add_argument("--robot-ip", default="192.168.1.216")
-    capture.add_argument("--marker-id", type=int, default=0)
-    capture.add_argument("--marker-length-m", type=float, required=True)
+    capture.add_argument("--squares-x", type=int, default=4)
+    capture.add_argument("--squares-y", type=int, default=5)
+    capture.add_argument("--square-length-m", type=float, default=0.030)
+    capture.add_argument("--marker-length-m", type=float, default=0.022)
     capture.add_argument("--dictionary", default="DICT_4X4_50")
+    capture.add_argument("--min-charuco-corners", type=int, default=8)
     capture.add_argument(
-        "--samples", type=Path, default=Path("calibration/eye_to_hand_samples.json")
+        "--samples",
+        type=Path,
+        default=Path("calibration/eye_to_hand_charuco_samples.json"),
     )
     capture.add_argument(
         "--image-dir", type=Path, default=Path("calibration/captures")
@@ -539,7 +715,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     solve = subparsers.add_parser("solve")
     solve.add_argument(
-        "--samples", type=Path, default=Path("calibration/eye_to_hand_samples.json")
+        "--samples",
+        type=Path,
+        default=Path("calibration/eye_to_hand_charuco_samples.json"),
     )
     solve.add_argument(
         "--output", type=Path, default=Path("calibration/eye_to_hand.json")
@@ -564,14 +742,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     indent=2,
                 )
             )
-        elif arguments.command == "generate-marker":
-            path = generate_marker(
+        elif arguments.command == "generate-board":
+            result = generate_charuco_board(
                 arguments.output.expanduser().resolve(),
-                arguments.marker_id,
+                arguments.squares_x,
+                arguments.squares_y,
+                arguments.square_length_m,
+                arguments.marker_length_m,
                 arguments.dictionary,
-                arguments.pixels,
+                arguments.pixels_per_square,
+                arguments.margin_pixels,
             )
-            print(json.dumps({"marker": str(path)}, indent=2))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         elif arguments.command == "capture":
             sample = capture_sample(arguments)
             print(json.dumps(sample, ensure_ascii=False, indent=2))

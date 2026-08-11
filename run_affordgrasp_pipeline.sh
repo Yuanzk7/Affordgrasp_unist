@@ -5,27 +5,104 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 사용법:
-  전체 실행:   ./run_affordgrasp_pipeline.sh "사용자 작업 지시" 촬영_prefix
+  인식 실행:   ./run_affordgrasp_pipeline.sh "사용자 작업 지시" 촬영_prefix
+  촬영→로봇:  ./run_affordgrasp_pipeline.sh --execute \
+                 --confirm MOVE_XARM7_192_168_1_216 \
+                 --acknowledge-cleared-workspace \
+                 --acknowledge-estop-ready \
+                 "사용자 작업 지시" 촬영_prefix
   단계 재실행: ./run_affordgrasp_pipeline.sh --stage icar "사용자 작업 지시" 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage localization 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage mask 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage grasp 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage camera-sim 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage robot-plan 촬영_prefix
+               ./run_affordgrasp_pipeline.sh --stage robot-collision 촬영_prefix
+               ./run_affordgrasp_pipeline.sh --stage robot-execute [승인 옵션] 촬영_prefix
 
 --stage 재실행은 새로 촬영하지 않고 기존 captures/ 촬영본과
 runs/<prefix>/json 결과를 사용해 해당 단계만 다시 실행한다.
+--execute는 촬영부터 full-link 충돌 검증까지 새로 수행하고, 검증을 통과한
+동일 plan을 xArm7에서 실행한다. --robot-mode는 pregrasp, grasp-check, full 중
+하나이며 기본값은 full이다.
 설정은 config.env에서 읽는다.
 EOF
   exit 64
 }
 
 PIPELINE_STAGE=all
-if [[ ${1:-} == "--stage" ]]; then
-  [[ $# -ge 2 ]] || usage
-  PIPELINE_STAGE=$2
-  shift 2
+PIPELINE_STAGE_EXPLICIT=false
+PIPELINE_EXECUTE=false
+PIPELINE_ROBOT_MODE=full
+PIPELINE_CONFIRM=""
+PIPELINE_ACK_WORKSPACE=false
+PIPELINE_ACK_ESTOP=false
+declare -a PIPELINE_POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --stage)
+      [[ $# -ge 2 ]] || usage
+      PIPELINE_STAGE=$2
+      PIPELINE_STAGE_EXPLICIT=true
+      shift 2
+      ;;
+    --execute)
+      PIPELINE_EXECUTE=true
+      shift
+      ;;
+    --robot-mode)
+      [[ $# -ge 2 ]] || usage
+      PIPELINE_ROBOT_MODE=$2
+      shift 2
+      ;;
+    --confirm)
+      [[ $# -ge 2 ]] || usage
+      PIPELINE_CONFIRM=$2
+      shift 2
+      ;;
+    --acknowledge-cleared-workspace)
+      PIPELINE_ACK_WORKSPACE=true
+      shift
+      ;;
+    --acknowledge-estop-ready)
+      PIPELINE_ACK_ESTOP=true
+      shift
+      ;;
+    -h | --help)
+      usage
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        PIPELINE_POSITIONAL+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "알 수 없는 옵션: $1" >&2
+      usage
+      ;;
+    *)
+      PIPELINE_POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+set -- "${PIPELINE_POSITIONAL[@]}"
+
+if $PIPELINE_EXECUTE && $PIPELINE_STAGE_EXPLICIT; then
+  echo "--execute와 --stage는 함께 사용할 수 없습니다." >&2
+  usage
 fi
+case $PIPELINE_ROBOT_MODE in
+  pregrasp | grasp-check | full) ;;
+  *)
+    echo "--robot-mode는 pregrasp, grasp-check 또는 full이어야 합니다." >&2
+    usage
+    ;;
+esac
 
 case $PIPELINE_STAGE in
   all | icar)
@@ -33,12 +110,19 @@ case $PIPELINE_STAGE in
     PIPELINE_INSTRUCTION=$1
     PIPELINE_PREFIX=$2
     ;;
-  localization | mask | grasp | camera-sim | robot-plan)
+  localization | mask | grasp | camera-sim | robot-plan | robot-collision | robot-execute)
     [[ $# -eq 1 ]] || usage
     PIPELINE_PREFIX=$1
     ;;
   *) usage ;;
 esac
+
+if [[ $PIPELINE_STAGE != robot-execute ]] && ! $PIPELINE_EXECUTE; then
+  if [[ -n $PIPELINE_CONFIRM ]] || $PIPELINE_ACK_WORKSPACE || $PIPELINE_ACK_ESTOP; then
+    echo "로봇 승인 옵션은 --execute 또는 --stage robot-execute에서만 사용합니다." >&2
+    usage
+  fi
+fi
 
 if [[ ! "$PIPELINE_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "촬영 prefix는 영문자/숫자로 시작하고 영문자, 숫자, '.', '_', '-'만 사용할 수 있습니다." >&2
@@ -60,11 +144,11 @@ PIPELINE_MIN_CONFIDENCE=${AFFORDGRASP_MIN_CONFIDENCE:-0.70}
 PIPELINE_OBJECT_THRESHOLD=${AFFORDGRASP_OBJECT_THRESHOLD:-0.01}
 PIPELINE_OBJECT_TOP_K=${AFFORDGRASP_OBJECT_TOP_K:-10}
 PIPELINE_SELECTION_METHOD=${AFFORDGRASP_SELECTION_METHOD:-gemini-top-k}
-PIPELINE_SELECTOR_MODEL=${AFFORDGRASP_SELECTOR_MODEL:-gemini-3.6-flash}
+PIPELINE_SELECTOR_MODEL=${AFFORDGRASP_SELECTOR_MODEL:-gemini-3.5-flash-lite}
 PIPELINE_SELECTOR_CONFIDENCE=${AFFORDGRASP_SELECTOR_CONFIDENCE:-0.55}
 PIPELINE_SELECTOR_TIMEOUT=${AFFORDGRASP_SELECTOR_TIMEOUT:-60}
 PIPELINE_PART_THRESHOLD=${AFFORDGRASP_PART_THRESHOLD:-0.01}
-PIPELINE_DEVICE=${AFFORDGRASP_DEVICE:-cpu}
+PIPELINE_DEVICE=${AFFORDGRASP_DEVICE:-cuda}
 PIPELINE_VLPART_ROOT=${AFFORDGRASP_VLPART_ROOT:-$PIPELINE_PROJECT_DIR/VLPart}
 PIPELINE_VLPART_WEIGHTS=${AFFORDGRASP_VLPART_WEIGHTS:-$PIPELINE_VLPART_ROOT/models/r50_pascalpart.pth}
 PIPELINE_VLPART_ENV=${AFFORDGRASP_VLPART_ENV:-$PIPELINE_VLPART_ROOT/.conda}
@@ -75,8 +159,11 @@ PIPELINE_ANYGRASP_SDK=${AFFORDGRASP_ANYGRASP_SDK:-}
 PIPELINE_ANYGRASP_CHECKPOINT=${AFFORDGRASP_ANYGRASP_CHECKPOINT:-}
 PIPELINE_ANYGRASP_ENV=${AFFORDGRASP_ANYGRASP_ENV:-}
 PIPELINE_OMP_NUM_THREADS=${AFFORDGRASP_OMP_NUM_THREADS:-16}
+PIPELINE_ROBOT_IP=${AFFORDGRASP_ROBOT_IP:-192.168.1.216}
 PIPELINE_ROBOT_CONFIG=${AFFORDGRASP_ROBOT_CONFIG:-$PIPELINE_PROJECT_DIR/robot_config.json}
 PIPELINE_EYE_TO_HAND_CALIBRATION=${AFFORDGRASP_EYE_TO_HAND_CALIBRATION:-$PIPELINE_PROJECT_DIR/calibration/eye_to_hand.json}
+PIPELINE_XARM_ROS2_ROOT=${AFFORDGRASP_XARM_ROS2_ROOT:-$PIPELINE_PROJECT_DIR/xarm_ros2}
+PIPELINE_COLLISION_MAX_AGE=${AFFORDGRASP_COLLISION_VALIDATION_MAX_AGE_SECONDS:-300}
 PIPELINE_SIM_PREGRASP_OFFSET=${AFFORDGRASP_SIM_PREGRASP_OFFSET:-0.12}
 PIPELINE_SIM_RETREAT_OFFSET=${AFFORDGRASP_SIM_RETREAT_OFFSET:-0.12}
 PIPELINE_SIM_LIFT_OFFSET=${AFFORDGRASP_SIM_LIFT_OFFSET:-0.08}
@@ -95,6 +182,22 @@ PIPELINE_RGB_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_rgb.png
 PIPELINE_DEPTH_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_${PIPELINE_GRASP_DEPTH_SOURCE}.png
 PIPELINE_CAMERA_INFO=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_camera.json
 PIPELINE_AFFORDANCE_MASK=$PIPELINE_MASK_DIR/affordance_mask.png
+
+if $PIPELINE_EXECUTE || [[ $PIPELINE_STAGE == robot-execute ]]; then
+  PIPELINE_EXPECTED_CONFIRM="MOVE_XARM7_${PIPELINE_ROBOT_IP//./_}"
+  if [[ $PIPELINE_CONFIRM != "$PIPELINE_EXPECTED_CONFIRM" ]]; then
+    echo "--confirm은 정확히 $PIPELINE_EXPECTED_CONFIRM 이어야 합니다." >&2
+    exit 64
+  fi
+  if ! $PIPELINE_ACK_WORKSPACE; then
+    echo "--acknowledge-cleared-workspace가 필요합니다." >&2
+    exit 64
+  fi
+  if ! $PIPELINE_ACK_ESTOP; then
+    echo "--acknowledge-estop-ready가 필요합니다." >&2
+    exit 64
+  fi
+fi
 
 case $PIPELINE_GRASP_DEPTH_SOURCE in
   raw | filtered) ;;
@@ -123,6 +226,21 @@ require_vlpart() {
   fi
   if ! command -v conda >/dev/null 2>&1; then
     echo "conda 명령을 찾을 수 없습니다." >&2
+    exit 2
+  fi
+}
+
+require_robot_prerequisites() {
+  require_file "$PIPELINE_EYE_TO_HAND_CALIBRATION" \
+    "통과한 eye-to-hand 캘리브레이션이 없습니다"
+  require_file "$PIPELINE_ROBOT_CONFIG" \
+    "로봇 설정 파일이 없습니다"
+  if [[ ! -d $PIPELINE_XARM_ROS2_ROOT/xarm_description ]]; then
+    echo "공식 xarm_ros2 모델이 없습니다: $PIPELINE_XARM_ROS2_ROOT" >&2
+    exit 2
+  fi
+  if [[ -z $PIPELINE_ANYGRASP_ENV || ! -d $PIPELINE_ANYGRASP_ENV ]]; then
+    echo "로봇 단계에 사용할 Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
     exit 2
   fi
 }
@@ -313,6 +431,61 @@ run_robot_plan() {
     --mode plan
 }
 
+run_robot_collision() {
+  require_file "$PIPELINE_ROBOT_DIR/robot_plan.json" \
+    "xArm7 robot plan이 없습니다"
+  require_file "$PIPELINE_ROBOT_CONFIG" \
+    "로봇 설정 파일이 없습니다"
+  if [[ ! -d $PIPELINE_XARM_ROS2_ROOT/xarm_description ]]; then
+    echo "공식 xarm_ros2 모델이 없습니다: $PIPELINE_XARM_ROS2_ROOT" >&2
+    exit 2
+  fi
+  if [[ -z $PIPELINE_ANYGRASP_ENV || ! -d $PIPELINE_ANYGRASP_ENV ]]; then
+    echo "충돌 검증에 사용할 Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
+    exit 2
+  fi
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+  conda run --prefix "$PIPELINE_ANYGRASP_ENV" \
+  python -m affordgrasp_icar.robot.full_collision_validation \
+    --plan "$PIPELINE_ROBOT_DIR/robot_plan.json" \
+    --robot-config "$PIPELINE_ROBOT_CONFIG" \
+    --xarm-ros2-root "$PIPELINE_XARM_ROS2_ROOT" \
+    --output "$PIPELINE_ROBOT_DIR/collision_validation.json"
+}
+
+run_robot_execute() {
+  require_file "$PIPELINE_ROBOT_DIR/robot_plan.json" \
+    "실행할 xArm7 robot plan이 없습니다"
+  require_file "$PIPELINE_ROBOT_DIR/collision_validation.json" \
+    "최신 전체 링크 충돌 검증 결과가 없습니다"
+  require_file "$PIPELINE_ROBOT_CONFIG" \
+    "로봇 설정 파일이 없습니다"
+  if [[ -z $PIPELINE_ANYGRASP_ENV || ! -d $PIPELINE_ANYGRASP_ENV ]]; then
+    echo "Robot 실행에 사용할 Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
+    exit 2
+  fi
+
+  local -a robot_command=(
+    python -m affordgrasp_icar.robot.xarm_grasp_execution
+    --plan "$PIPELINE_ROBOT_DIR/robot_plan.json"
+    --collision-validation "$PIPELINE_ROBOT_DIR/collision_validation.json"
+    --robot-config "$PIPELINE_ROBOT_CONFIG"
+    --output "$PIPELINE_ROBOT_DIR/robot_plan.json"
+    --mode "$PIPELINE_ROBOT_MODE"
+    --maximum-validation-age-seconds "$PIPELINE_COLLISION_MAX_AGE"
+    --confirm "$PIPELINE_CONFIRM"
+  )
+  if $PIPELINE_ACK_WORKSPACE; then
+    robot_command+=(--acknowledge-cleared-workspace)
+  fi
+  if $PIPELINE_ACK_ESTOP; then
+    robot_command+=(--acknowledge-estop-ready)
+  fi
+
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
+  conda run --prefix "$PIPELINE_ANYGRASP_ENV" "${robot_command[@]}"
+}
+
 mkdir -p \
   "$PIPELINE_CAPTURE_DIR" \
   "$PIPELINE_JSON_DIR" \
@@ -325,12 +498,20 @@ mkdir -p \
 case $PIPELINE_STAGE in
   all)
     require_vlpart
+    if $PIPELINE_EXECUTE; then
+      require_robot_prerequisites
+    fi
     run_capture
     run_icar
     run_localization
     run_mask
     run_grasp
     run_camera_sim
+    if $PIPELINE_EXECUTE; then
+      run_robot_plan
+      run_robot_collision
+      run_robot_execute
+    fi
     printf 'AffordGrasp 전체 실행 완료\n'
     printf 'RGB: %s\n' "$PIPELINE_RGB_IMAGE"
     printf 'Raw depth: %s\n' "$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_raw.png"
@@ -350,6 +531,12 @@ case $PIPELINE_STAGE in
     printf 'Camera trajectory JSON: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.json"
     printf 'Camera trajectory 3D: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory_3d.png"
     printf 'Camera trajectory GIF: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.gif"
+    if $PIPELINE_EXECUTE; then
+      printf 'Robot plan: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan.json"
+      printf 'Collision validation: %s\n' "$PIPELINE_ROBOT_DIR/collision_validation.json"
+      printf 'Robot execution: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan_execution.json"
+      printf 'Robot mode: %s\n' "$PIPELINE_ROBOT_MODE"
+    fi
     ;;
   icar)
     run_icar
@@ -390,5 +577,17 @@ case $PIPELINE_STAGE in
     printf 'xArm7 robot plan 생성 완료\n'
     printf 'Plan: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan.json"
     printf '이 단계는 로봇에 연결하거나 이동 명령을 보내지 않습니다.\n'
+    ;;
+  robot-collision)
+    run_robot_collision
+    printf 'xArm7 전체 링크·테이블 충돌 검증 완료\n'
+    printf 'Result: %s\n' "$PIPELINE_ROBOT_DIR/collision_validation.json"
+    printf '이 단계는 읽기 전용 IK만 조회하며 로봇을 움직이지 않습니다.\n'
+    ;;
+  robot-execute)
+    run_robot_execute
+    printf '검증된 xArm7 plan 실행 완료\n'
+    printf 'Mode: %s\n' "$PIPELINE_ROBOT_MODE"
+    printf 'Execution: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan_execution.json"
     ;;
 esac

@@ -23,13 +23,16 @@ def connect_xarm(
             "'python -m pip install xarm-python-sdk'"
         ) from exc
 
-    arm = XArmAPI(
-        robot_ip,
-        is_radian=True,
-        do_not_open=False,
-        enable_report=True,
-        report_type="rich",
-    )
+    try:
+        arm = XArmAPI(
+            robot_ip,
+            is_radian=True,
+            do_not_open=False,
+            enable_report=True,
+            report_type="rich",
+        )
+    except Exception as exc:
+        raise error_type(f"could not connect to xArm at {robot_ip}: {exc}") from exc
     if not arm.connected:
         raise error_type(f"could not connect to xArm at {robot_ip}")
 

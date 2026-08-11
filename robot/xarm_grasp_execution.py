@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from .transforms import (
     load_base_to_camera,
     load_json_object,
     make_transform,
+    pose_aa_to_transform,
     rotation_distance_rad,
     transform_to_pose_aa,
     validate_rotation,
@@ -27,6 +29,14 @@ from .xarm_connection import connect_xarm, read_tcp_offset
 
 class RobotExecutionError(RuntimeError):
     """Raised before or during a guarded real-robot action."""
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -68,7 +78,70 @@ def _load_config(path: Path) -> Dict[str, Any]:
     if tcp_offset.shape != (6,) or not np.all(np.isfinite(tcp_offset)):
         raise RobotExecutionError("required_tcp_offset_mm must contain six values")
     payload["required_tcp_offset_mm"] = tcp_offset
+    ready_tcp = payload.get("ready_tcp_pose_mm_deg")
+    pose = np.asarray(ready_tcp, dtype=np.float64)
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        raise RobotExecutionError(
+            "ready_tcp_pose_mm_deg must contain six finite values"
+        )
+    payload["ready_tcp_pose_mm_deg"] = pose
+    payload["ready_tcp_transform"] = make_transform(
+        _rpy_to_rotation(np.deg2rad(pose[3:6])), pose[:3] / 1000.0
+    )
     return payload
+
+
+def _configured_ready(config: Mapping[str, Any]) -> Dict[str, Any]:
+    pose = np.asarray(config.get("ready_tcp_pose_mm_deg"), dtype=np.float64)
+    transform = validate_transform(
+        np.asarray(config.get("ready_tcp_transform"), dtype=np.float64),
+        "configured ready TCP",
+    )
+    return {
+        "tcp_pose_mm_deg": pose.tolist(),
+        "transform": transform.tolist(),
+    }
+
+
+def _plan_ready(
+    plan: Mapping[str, Any], config: Mapping[str, Any]
+) -> Dict[str, Any]:
+    ready = plan.get("ready")
+    if not isinstance(ready, dict):
+        raise RobotExecutionError(
+            "existing robot plan has no ready pose; rebuild robot-plan"
+        )
+    configured = _configured_ready(config)
+    pose = np.asarray(ready.get("tcp_pose_mm_deg"), dtype=np.float64)
+    expected = np.asarray(configured["tcp_pose_mm_deg"], dtype=np.float64)
+    transform = validate_transform(
+        np.asarray(ready.get("transform"), dtype=np.float64),
+        "robot plan ready TCP",
+    )
+    if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+        raise RobotExecutionError("robot plan has invalid ready TCP pose")
+    if not np.allclose(pose, expected, atol=1e-9, rtol=0.0):
+        raise RobotExecutionError(
+            "ready TCP pose changed after plan generation; rebuild robot-plan"
+        )
+    return {"tcp_pose_mm_deg": pose, "transform": transform}
+
+
+def _optional_number(
+    payload: Mapping[str, Any],
+    name: str,
+    default: float,
+    minimum: float = 0.0,
+) -> float:
+    value = payload.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RobotExecutionError(f"robot config {name!r} must be numeric")
+    result = float(value)
+    if not np.isfinite(result) or result < minimum:
+        raise RobotExecutionError(
+            f"robot config {name!r} must be finite and >= {minimum}"
+        )
+    return result
 
 
 def _candidate_records(grasp_payload: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
@@ -137,6 +210,8 @@ def _candidate_plan(
     tip_base = (
         rotation_base_camera @ tip_camera + base_to_camera[:3, 3]
     )
+    additional_grasp_depth = _number(config, "additional_grasp_depth_m")
+    tip_base = tip_base + additional_grasp_depth * approach_base
     rotation_base_tcp = rotation_base_grasp @ config["R_anygrasp_to_tcp"]
     target = make_transform(rotation_base_tcp, tip_base)
     pregrasp = target.copy()
@@ -146,6 +221,7 @@ def _candidate_plan(
     lift = retreat.copy()
     lift[2, 3] += _number(config, "lift_offset_m")
     workspace = config["workspace_m"]
+    minimum_transit_z = _number(config, "minimum_transit_z_m")
     for name, pose in (
         ("pregrasp", pregrasp),
         ("grasp", target),
@@ -154,6 +230,11 @@ def _candidate_plan(
     ):
         if not _point_in_workspace(pose[:3, 3], workspace):
             rejected.append(f"{name} lies outside workspace")
+        if name != "grasp" and float(pose[2, 3]) < minimum_transit_z:
+            rejected.append(
+                f"{name} is below minimum transit height "
+                f"{minimum_transit_z:.3f} m"
+            )
 
     if rejected:
         return None, rejected
@@ -167,6 +248,7 @@ def _candidate_plan(
         "anygrasp_score": score,
         "selection_objective": objective,
         "required_width_m": width,
+        "additional_grasp_depth_m": additional_grasp_depth,
         "approach_vector_base": approach_base.tolist(),
         "waypoints": {
             "pregrasp": pregrasp.tolist(),
@@ -188,6 +270,7 @@ def build_plan(
     calibration = load_json_object(calibration_path)
     base_to_camera = load_base_to_camera(calibration_path)
     config = _load_config(config_path)
+    ready = _configured_ready(config)
     calibration_robot = calibration.get("robot")
     if not isinstance(calibration_robot, dict):
         raise RobotExecutionError("calibration has no robot metadata")
@@ -232,7 +315,7 @@ def build_plan(
     )
     selected = accepted[0]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "plan_type": "xarm7_anygrasp_pick",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "robot_ip": config["robot_ip"],
@@ -240,16 +323,180 @@ def build_plan(
         "source_grasp_result": str(grasp_path.resolve()),
         "source_calibration": str(calibration_path.resolve()),
         "source_robot_config": str(config_path.resolve()),
+        "source_sha256": {
+            "grasp_result": _sha256_file(grasp_path),
+            "calibration": _sha256_file(calibration_path),
+            "robot_config": _sha256_file(config_path),
+        },
         "tool_alignment_verified": config.get("tool_alignment_verified") is True,
+        "ready": ready,
         "selected": selected,
         "accepted_candidate_count": len(accepted),
         "rejected": rejected,
         "workspace_m": config["workspace_m"].tolist(),
+        "minimum_transit_z_m": _number(config, "minimum_transit_z_m"),
         "limitations": [
             "AnyGrasp collision checks the local gripper pose, not the full xArm trajectory.",
             "Direct Cartesian segments require a physically cleared robot cell.",
+            "A tabletop grasp below minimum_transit_z_m is planning-only until "
+            "tabletop_execution_verified is enabled after a physical clearance check.",
             "Full execution is blocked until tool alignment is visually verified.",
         ],
+    }
+
+
+def _load_existing_plan(path: Path, config: Mapping[str, Any]) -> Dict[str, Any]:
+    plan = dict(load_json_object(path))
+    if plan.get("plan_type") != "xarm7_anygrasp_pick":
+        raise RobotExecutionError("existing plan is not an xArm7 AnyGrasp pick plan")
+    if plan.get("robot_ip") != config["robot_ip"]:
+        raise RobotExecutionError("existing plan robot IP does not match robot config")
+    source_sha256 = plan.get("source_sha256")
+    source_paths = {
+        "grasp_result": plan.get("source_grasp_result"),
+        "calibration": plan.get("source_calibration"),
+        "robot_config": plan.get("source_robot_config"),
+    }
+    if not isinstance(source_sha256, dict) or not all(
+        isinstance(value, str) for value in source_paths.values()
+    ):
+        raise RobotExecutionError(
+            "existing plan has no source hashes; rebuild robot-plan"
+        )
+    for name, source_path in source_paths.items():
+        assert isinstance(source_path, str)
+        if source_sha256.get(name) != _sha256_file(Path(source_path)):
+            raise RobotExecutionError(
+                f"{name.replace('_', ' ')} changed after plan generation; "
+                "rebuild robot-plan"
+            )
+    selected = plan.get("selected")
+    if not isinstance(selected, dict) or not isinstance(
+        selected.get("waypoints"), dict
+    ):
+        raise RobotExecutionError("existing robot plan has no selected waypoints")
+    for name in ("pregrasp", "grasp", "retreat", "lift"):
+        if name not in selected["waypoints"]:
+            raise RobotExecutionError(f"existing robot plan has no {name} waypoint")
+        validate_transform(
+            np.asarray(selected["waypoints"][name], dtype=np.float64), name
+        )
+    _plan_ready(plan, config)
+    return plan
+
+
+def _load_collision_approval(
+    validation_path: Path,
+    plan_path: Path,
+    config_path: Path,
+    maximum_age_seconds: float,
+) -> Dict[str, Any]:
+    validation = dict(load_json_object(validation_path))
+    if validation.get("validation_status") != "completed":
+        raise RobotExecutionError(
+            "collision validation is missing, incomplete, or failed"
+        )
+    if validation.get("modeled_collision_check_passed") is not True:
+        raise RobotExecutionError("modeled full-link collision validation did not pass")
+    if validation.get("safe_for_execution") is not True:
+        reasons = validation.get("blocking_reasons")
+        detail = "; ".join(map(str, reasons)) if isinstance(reasons, list) else ""
+        raise RobotExecutionError(
+            "collision validation is not approved for execution"
+            + (f": {detail}" if detail else "")
+        )
+    if validation.get("source_plan_sha256") != _sha256_file(plan_path):
+        raise RobotExecutionError(
+            "robot plan changed after collision validation; validate it again"
+        )
+    if validation.get("source_robot_config_sha256") != _sha256_file(config_path):
+        raise RobotExecutionError(
+            "robot config changed after collision validation; rebuild and validate again"
+        )
+    timestamp = validation.get("validated_at")
+    if not isinstance(timestamp, str):
+        raise RobotExecutionError("collision validation has no completion timestamp")
+    try:
+        completed_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RobotExecutionError(
+            "collision validation completion timestamp is invalid"
+        ) from exc
+    if completed_at.tzinfo is None:
+        raise RobotExecutionError("collision validation timestamp has no timezone")
+    age_seconds = (datetime.now(timezone.utc) - completed_at).total_seconds()
+    if age_seconds < -5.0 or age_seconds > maximum_age_seconds:
+        raise RobotExecutionError(
+            "collision validation is stale; run robot-collision immediately before "
+            f"execution (age={age_seconds:.1f}s, limit={maximum_age_seconds:.1f}s)"
+        )
+    return validation
+
+
+def _check_validation_start_state(
+    arm: Any,
+    status: Mapping[str, Any],
+    validation: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> Dict[str, float]:
+    expected_joints = np.asarray(
+        validation.get("robot_start_joints_rad"), dtype=np.float64
+    )
+    if expected_joints.shape != (7,) or not np.all(np.isfinite(expected_joints)):
+        raise RobotExecutionError(
+            "collision validation has no valid robot start joint state"
+        )
+    code, current_values = arm.get_servo_angle(is_radian=True)
+    if code != 0 or len(current_values) < 7:
+        raise RobotExecutionError(
+            f"could not read current joints before execution, code={code}"
+        )
+    current_joints = np.asarray(current_values[:7], dtype=np.float64)
+    wrapped_delta = np.arctan2(
+        np.sin(current_joints - expected_joints),
+        np.cos(current_joints - expected_joints),
+    )
+    maximum_joint_delta = float(np.max(np.abs(wrapped_delta)))
+    allowed_joint_delta = _optional_number(
+        config,
+        "maximum_validation_start_joint_delta_rad",
+        np.deg2rad(3.0),
+    )
+    if maximum_joint_delta > allowed_joint_delta:
+        raise RobotExecutionError(
+            "robot moved after collision validation; validate the path again "
+            f"(joint delta={np.rad2deg(maximum_joint_delta):.1f} deg)"
+        )
+
+    validated_status = validation.get("robot_status")
+    if not isinstance(validated_status, dict):
+        raise RobotExecutionError("collision validation has no robot start status")
+    expected_pose = pose_aa_to_transform(validated_status.get("tcp_pose_mm_rad", []))
+    current_pose = pose_aa_to_transform(status.get("tcp_pose_mm_rad", []))
+    translation_delta = float(
+        np.linalg.norm(current_pose[:3, 3] - expected_pose[:3, 3])
+    )
+    rotation_delta = rotation_distance_rad(
+        current_pose[:3, :3], expected_pose[:3, :3]
+    )
+    allowed_translation = _optional_number(
+        config, "maximum_validation_start_tcp_delta_m", 0.005
+    )
+    allowed_rotation = _optional_number(
+        config,
+        "maximum_validation_start_tcp_rotation_delta_rad",
+        np.deg2rad(3.0),
+    )
+    if translation_delta > allowed_translation or rotation_delta > allowed_rotation:
+        raise RobotExecutionError(
+            "robot TCP changed after collision validation; validate the path again "
+            f"({translation_delta * 1000.0:.1f} mm, "
+            f"{np.rad2deg(rotation_delta):.1f} deg)"
+        )
+    return {
+        "maximum_joint_delta_rad": maximum_joint_delta,
+        "tcp_translation_delta_m": translation_delta,
+        "tcp_rotation_delta_rad": rotation_delta,
     }
 
 
@@ -261,6 +508,12 @@ def _check_robot_status(arm: Any, config: Mapping[str, Any]) -> Dict[str, Any]:
     code, pose = arm.get_position_aa(is_radian=True)
     if code != 0:
         raise RobotExecutionError(f"could not read xArm TCP pose, code={code}")
+    joint_code, joint_values = arm.get_servo_angle(is_radian=True)
+    if joint_code != 0 or len(joint_values) < 7:
+        raise RobotExecutionError(
+            f"could not read xArm joint angles, code={joint_code}"
+        )
+    joints = np.asarray(joint_values[:7], dtype=np.float64)
     error_code = int(getattr(arm, "error_code", 0))
     warn_code = int(getattr(arm, "warn_code", 0))
     if error_code != 0:
@@ -286,10 +539,27 @@ def _check_robot_status(arm: Any, config: Mapping[str, Any]) -> Dict[str, Any]:
         "error_code": error_code,
         "warn_code": warn_code,
         "tcp_pose_mm_rad": list(map(float, pose[:6])),
+        "joint_angles_rad": joints.tolist(),
+        "joint_angles_deg": np.rad2deg(joints).tolist(),
         "tcp_offset_mm_rad": current_offset.tolist(),
         "required_tcp_offset_mm_rad": required_offset.tolist(),
         "tcp_offset_ok": bool(offset_ok),
     }
+
+
+def _rpy_to_rotation(rpy: Sequence[float]) -> np.ndarray:
+    roll, pitch, yaw = map(float, rpy)
+    sr, cr = np.sin(roll), np.cos(roll)
+    sp, cp = np.sin(pitch), np.cos(pitch)
+    sy, cy = np.sin(yaw), np.cos(yaw)
+    return np.asarray(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _rotation_to_rpy(rotation: np.ndarray) -> np.ndarray:
@@ -310,12 +580,14 @@ def _check_ik(
     arm: Any,
     waypoints: Mapping[str, Any],
     maximum_joint_step_rad: float,
+    reference_angles: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     results = {}
-    reference = None
-    code, current_angles = arm.get_servo_angle(is_radian=True)
-    if code == 0:
-        reference = current_angles
+    reference = None if reference_angles is None else list(reference_angles)
+    if reference is None:
+        code, current_angles = arm.get_servo_angle(is_radian=True)
+        if code == 0:
+            reference = current_angles
     for name in ("pregrasp", "grasp", "retreat", "lift"):
         transform = validate_transform(np.asarray(waypoints[name], dtype=np.float64))
         rpy = _rotation_to_rpy(transform[:3, :3])
@@ -354,6 +626,81 @@ def _check_code(arm: Any, code: int, operation: str) -> None:
         )
 
 
+def _ready_reference_joints(
+    arm: Any,
+    ready: Mapping[str, Any],
+    current_joints: Sequence[float],
+) -> np.ndarray:
+    transform = validate_transform(
+        np.asarray(ready["transform"], dtype=np.float64), "ready TCP"
+    )
+    rpy = _rotation_to_rpy(transform[:3, :3])
+    pose = [*(transform[:3, 3] * 1000.0).tolist(), *rpy.tolist()]
+    code, values = arm.get_inverse_kinematics(
+        pose,
+        input_is_radian=True,
+        return_is_radian=True,
+        limited=True,
+        ref_angles=list(current_joints),
+    )
+    if code != 0 or len(values) < 7:
+        raise RobotExecutionError(f"xArm IK failed for Cartesian ready, code={code}")
+    return np.asarray(values[:7], dtype=np.float64)
+
+
+def _move_to_ready(
+    arm: Any,
+    ready: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    pose = np.asarray(ready["tcp_pose_mm_deg"], dtype=np.float64)
+    code = arm.set_position(
+        x=float(pose[0]),
+        y=float(pose[1]),
+        z=float(pose[2]),
+        roll=float(pose[3]),
+        pitch=float(pose[4]),
+        yaw=float(pose[5]),
+        speed=_optional_number(config, "ready_tcp_speed_mm_s", 100.0, minimum=0.1),
+        mvacc=_optional_number(
+            config, "ready_tcp_acceleration_mm_s2", 150.0, minimum=0.1
+        ),
+        is_radian=False,
+        wait=True,
+        timeout=60,
+        radius=-1,
+    )
+    _check_code(arm, int(code), "move to ready TCP pose")
+
+    read_code, reached_values = arm.get_position(is_radian=False)
+    _check_code(arm, int(read_code), "read TCP after ready")
+    reached = np.asarray(reached_values[:6], dtype=np.float64)
+    translation_error = float(np.linalg.norm(reached[:3] - pose[:3]))
+    target_rotation = _rpy_to_rotation(np.deg2rad(pose[3:6]))
+    reached_rotation = _rpy_to_rotation(np.deg2rad(reached[3:6]))
+    rotation_error = rotation_distance_rad(target_rotation, reached_rotation)
+    translation_tolerance = _optional_number(
+        config, "ready_tcp_translation_tolerance_mm", 5.0
+    )
+    rotation_tolerance = np.deg2rad(
+        _optional_number(config, "ready_tcp_rotation_tolerance_deg", 3.0)
+    )
+    if (
+        translation_error > translation_tolerance
+        or rotation_error > rotation_tolerance
+    ):
+        raise RobotExecutionError(
+            "ready TCP tracking error is too high: "
+            f"{translation_error:.1f} mm, {np.rad2deg(rotation_error):.1f} deg"
+        )
+    return {
+        "target_tcp_pose_mm_deg": pose.tolist(),
+        "reached_tcp_pose_mm_deg": reached.tolist(),
+        "translation_error_mm": translation_error,
+        "rotation_error_rad": rotation_error,
+    }
+
+
 def _move(arm: Any, transform: np.ndarray, speed: float, acceleration: float, label: str) -> None:
     code = arm.set_position_aa(
         transform_to_pose_aa(transform),
@@ -384,6 +731,7 @@ def execute_plan(
     plan: Mapping[str, Any],
     config: Mapping[str, Any],
     mode: str,
+    collision_validation: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     arm = _connect(config)
     motion_started = False
@@ -391,32 +739,51 @@ def execute_plan(
         status = _check_robot_status(arm, config)
         if mode == "connect":
             return {"mode": mode, "status": status}
+        if mode in {"pregrasp", "grasp-check", "full"}:
+            if collision_validation is None:
+                raise RobotExecutionError(
+                    "a fresh collision validation is required before robot motion"
+                )
+            validation_start_state = _check_validation_start_state(
+                arm, status, collision_validation, config
+            )
+        else:
+            validation_start_state = None
+        ready = _plan_ready(plan, config)
         if not status["tcp_offset_ok"]:
             raise RobotExecutionError(
                 "xArm TCP offset does not match the configured xArm Gripper offset; "
                 f"current={status['tcp_offset_mm_rad']}, "
                 f"required={status['required_tcp_offset_mm_rad']}"
             )
-        if mode == "full" and config.get("tool_alignment_verified") is not True:
+        if (
+            mode in {"grasp-check", "full"}
+            and config.get("tool_alignment_verified") is not True
+        ):
             raise RobotExecutionError(
                 "full grasp is blocked until the pregrasp orientation is visually "
                 "checked and tool_alignment_verified is set to true"
             )
         waypoints = plan["selected"]["waypoints"]
-        pregrasp = validate_transform(np.asarray(waypoints["pregrasp"]))
-        current_position = np.asarray(status["tcp_pose_mm_rad"][:3]) / 1000.0
-        initial_distance = float(
-            np.linalg.norm(pregrasp[:3, 3] - current_position)
-        )
-        if initial_distance > _number(config, "maximum_initial_move_m"):
+        grasp = validate_transform(np.asarray(waypoints["grasp"]))
+        if (
+            mode in {"grasp-check", "full"}
+            and float(grasp[2, 3]) < _number(config, "minimum_transit_z_m")
+            and config.get("tabletop_execution_verified") is not True
+        ):
             raise RobotExecutionError(
-                "current TCP is too far from pregrasp for a direct Cartesian move: "
-                f"{initial_distance:.3f} m"
+                "tabletop grasp execution is blocked until gripper/table clearance "
+                "is physically checked and tabletop_execution_verified is set to true"
             )
+        pregrasp = validate_transform(np.asarray(waypoints["pregrasp"]))
+        ready_reference = _ready_reference_joints(
+            arm, ready, status["joint_angles_rad"]
+        )
         ik = _check_ik(
             arm,
             waypoints,
             _number(config, "maximum_joint_step_rad"),
+            reference_angles=ready_reference,
         )
 
         _check_code(
@@ -431,6 +798,7 @@ def execute_plan(
         _check_code(arm, int(arm.set_state(0)), "ready state")
         motion_started = True
 
+        ready_result = _move_to_ready(arm, ready, config)
         gripper_speed = int(_number(config, "gripper_speed_units"))
         open_units = int(_number(config, "gripper_open_units"))
         code = arm.set_gripper_enable(True)
@@ -445,9 +813,14 @@ def execute_plan(
         acceleration = _number(config, "travel_acceleration_mm_s2")
         _move(arm, pregrasp, speed, acceleration, "pregrasp")
         if mode == "pregrasp":
-            return {"mode": mode, "status_before": status, "ik": ik}
+            return {
+                "mode": mode,
+                "status_before": status,
+                "validation_start_state": validation_start_state,
+                "ready": ready_result,
+                "ik": ik,
+            }
 
-        grasp = validate_transform(np.asarray(waypoints["grasp"]))
         _move(
             arm,
             grasp,
@@ -455,6 +828,14 @@ def execute_plan(
             acceleration,
             "grasp",
         )
+        if mode == "grasp-check":
+            return {
+                "mode": mode,
+                "status_before": status,
+                "validation_start_state": validation_start_state,
+                "ready": ready_result,
+                "ik": ik,
+            }
         close_units = int(_number(config, "gripper_close_units"))
         _check_code(
             arm,
@@ -470,6 +851,8 @@ def execute_plan(
         return {
             "mode": mode,
             "status_before": status,
+            "validation_start_state": validation_start_state,
+            "ready": ready_result,
             "ik": ik,
             "gripper_position_after_close": float(grip_position),
         }
@@ -486,7 +869,12 @@ def execute_plan(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--grasp-result", type=Path, required=True)
+    parser.add_argument("--grasp-result", type=Path)
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        help="기존 robot plan을 그대로 실행할 때 사용",
+    )
     parser.add_argument(
         "--calibration", type=Path, default=Path("calibration/eye_to_hand.json")
     )
@@ -495,11 +883,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=Path("runs/robot_plan.json"))
     parser.add_argument(
-        "--mode", choices=("plan", "connect", "pregrasp", "full"), default="plan"
+        "--mode",
+        choices=("plan", "connect", "pregrasp", "grasp-check", "full"),
+        default="plan",
     )
     parser.add_argument("--confirm", default="")
     parser.add_argument("--acknowledge-cleared-workspace", action="store_true")
     parser.add_argument("--acknowledge-estop-ready", action="store_true")
+    parser.add_argument(
+        "--collision-validation",
+        type=Path,
+        help="실행할 plan과 일치하는 최신 전체 링크 충돌 검증 JSON",
+    )
+    parser.add_argument(
+        "--maximum-validation-age-seconds",
+        type=float,
+        default=300.0,
+        help="실제 이동에 허용할 충돌 검증 최대 경과 시간 (기본 300초)",
+    )
     return parser
 
 
@@ -508,22 +909,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         config_path = arguments.robot_config.expanduser().resolve()
         config = _load_config(config_path)
-        plan = build_plan(
-            arguments.grasp_result.expanduser().resolve(),
-            arguments.calibration.expanduser().resolve(),
-            config_path,
-        )
         output_path = arguments.output.expanduser().resolve()
-        _write_json(output_path, plan)
+        motion_modes = {"pregrasp", "grasp-check", "full"}
+
+        if arguments.mode == "connect":
+            if arguments.plan is not None or arguments.grasp_result is not None:
+                print(
+                    "참고: connect 모드는 grasp/plan 파일을 사용하지 않습니다.",
+                    file=sys.stderr,
+                )
+            plan: Dict[str, Any] = {}
+            plan_path: Optional[Path] = None
+        elif arguments.plan is not None:
+            if arguments.grasp_result is not None:
+                raise RobotExecutionError(
+                    "--plan and --grasp-result cannot be used together"
+                )
+            plan_path = arguments.plan.expanduser().resolve()
+            plan = _load_existing_plan(plan_path, config)
+        else:
+            if arguments.grasp_result is None:
+                raise RobotExecutionError(
+                    "--grasp-result is required to build a robot plan"
+                )
+            if arguments.mode in motion_modes:
+                raise RobotExecutionError(
+                    "robot motion requires --plan so the exact collision-validated "
+                    "plan is executed"
+                )
+            plan = build_plan(
+                arguments.grasp_result.expanduser().resolve(),
+                arguments.calibration.expanduser().resolve(),
+                config_path,
+            )
+            _write_json(output_path, plan)
+            plan_path = output_path
+
         if arguments.mode == "plan":
             print(
                 json.dumps(
-                    {"plan": str(output_path), "selected": plan["selected"]},
+                    {
+                        "plan": str(plan_path),
+                        "ready": plan["ready"],
+                        "selected": plan["selected"],
+                    },
                     indent=2,
                 )
             )
             return 0
-        if arguments.mode in {"pregrasp", "full"}:
+
+        collision_validation: Optional[Dict[str, Any]] = None
+        if arguments.mode in motion_modes:
             expected = "MOVE_XARM7_" + config["robot_ip"].replace(".", "_")
             if arguments.confirm != expected:
                 raise RobotExecutionError(f"--confirm must be exactly {expected}")
@@ -531,7 +967,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RobotExecutionError("--acknowledge-cleared-workspace is required")
             if not arguments.acknowledge_estop_ready:
                 raise RobotExecutionError("--acknowledge-estop-ready is required")
-        result = execute_plan(plan, config, arguments.mode)
+            if arguments.collision_validation is None or plan_path is None:
+                raise RobotExecutionError(
+                    "--collision-validation is required for robot motion"
+                )
+            if arguments.maximum_validation_age_seconds <= 0.0:
+                raise RobotExecutionError(
+                    "--maximum-validation-age-seconds must be positive"
+                )
+            collision_validation = _load_collision_approval(
+                arguments.collision_validation.expanduser().resolve(),
+                plan_path,
+                config_path,
+                arguments.maximum_validation_age_seconds,
+            )
+
+        result = execute_plan(
+            plan,
+            config,
+            arguments.mode,
+            collision_validation=collision_validation,
+        )
         execution_path = output_path.with_name(output_path.stem + "_execution.json")
         _write_json(execution_path, {"plan": plan, "execution": result})
         print(json.dumps({"execution": str(execution_path), **result}, indent=2))

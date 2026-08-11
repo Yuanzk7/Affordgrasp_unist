@@ -22,6 +22,7 @@ venv/
 
 # External repositories, environments, and model weights
 /VLPart/
+/xarm_ros2/
 *.pth
 *.pt
 *.ckpt
