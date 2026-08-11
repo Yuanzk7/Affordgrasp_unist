@@ -39,7 +39,7 @@
     "table_center_xy_m": [0.30, 0.0],
     "table_size_xy_m": [1.20, 1.00],
     "table_thickness_m": 0.08,
-    "required_table_clearance_m": 0.010,
+    "required_table_clearance_m": 0.000,
     "self_collision_clearance_m": 0.005,
     "nominal_model_uncertainty_m": 0.010,
     "maximum_model_error_m": 0.015,

@@ -8,7 +8,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -162,8 +162,8 @@ def _candidate_plan(
     candidate: Mapping[str, Any],
     base_to_camera: np.ndarray,
     config: Mapping[str, Any],
-) -> Tuple[Optional[Dict[str, Any]], Sequence[str]]:
-    rejected = []
+) -> Optional[Dict[str, Any]]:
+    invalid = False
     try:
         rotation_camera_grasp = validate_rotation(
             np.asarray(candidate.get("R"), dtype=np.float64),
@@ -173,20 +173,20 @@ def _candidate_plan(
         width = float(candidate.get("w"))
         score = float(candidate.get("score"))
     except (TypeError, ValueError, TransformError):
-        return None, ["malformed candidate"]
+        return None
     if not np.all(np.isfinite(center_camera)) or not np.isfinite(width + score):
-        return None, ["candidate contains non-finite values"]
+        return None
     if score < _number(config, "minimum_anygrasp_score"):
-        rejected.append("score below configured minimum")
+        invalid = True
     if width <= 0.0 or width > _number(config, "gripper_max_opening_m"):
-        rejected.append("required width exceeds xArm Gripper opening")
+        invalid = True
     metadata = candidate.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
     if metadata.get("collision_detection") is not True:
-        rejected.append("AnyGrasp collision detection was not enabled")
+        invalid = True
     if metadata.get("region_steering") is not True:
-        rejected.append("AnyGrasp region steering was not enabled")
+        invalid = True
 
     tip_value = candidate.get("gripper_tip_xyz_m")
     if tip_value is None:
@@ -196,16 +196,14 @@ def _candidate_plan(
         try:
             tip_camera = np.asarray(tip_value, dtype=np.float64).reshape(3)
         except (TypeError, ValueError):
-            return None, ["malformed gripper tip"]
+            return None
 
     rotation_base_camera = base_to_camera[:3, :3]
     rotation_base_grasp = rotation_base_camera @ rotation_camera_grasp
     approach_base = rotation_base_grasp[:, 0]
     maximum_z = float(config.get("maximum_approach_z", -0.20))
     if float(approach_base[2]) > maximum_z:
-        rejected.append(
-            "approach is not sufficiently downward in the robot base frame"
-        )
+        invalid = True
 
     tip_base = (
         rotation_base_camera @ tip_camera + base_to_camera[:3, 3]
@@ -229,15 +227,12 @@ def _candidate_plan(
         ("lift", lift),
     ):
         if not _point_in_workspace(pose[:3, 3], workspace):
-            rejected.append(f"{name} lies outside workspace")
+            invalid = True
         if name != "grasp" and float(pose[2, 3]) < minimum_transit_z:
-            rejected.append(
-                f"{name} is below minimum transit height "
-                f"{minimum_transit_z:.3f} m"
-            )
+            invalid = True
 
-    if rejected:
-        return None, rejected
+    if invalid:
+        return None
     objective = candidate.get("selection_objective", score)
     try:
         objective = float(objective)
@@ -256,7 +251,7 @@ def _candidate_plan(
             "retreat": retreat.tolist(),
             "lift": lift.tolist(),
         },
-    }, []
+    }
 
 
 def build_plan(
@@ -298,12 +293,9 @@ def build_plan(
             "grasp D435 serial does not match the calibrated D435"
         )
     accepted = []
-    rejected = []
-    for ordinal, candidate in enumerate(_candidate_records(grasp)):
-        plan, reasons = _candidate_plan(candidate, base_to_camera, config)
-        if plan is None:
-            rejected.append({"candidate": ordinal, "reasons": list(reasons)})
-        else:
+    for candidate in _candidate_records(grasp):
+        plan = _candidate_plan(candidate, base_to_camera, config)
+        if plan is not None:
             accepted.append(plan)
     if not accepted:
         raise RobotExecutionError(
@@ -313,9 +305,8 @@ def build_plan(
         key=lambda item: (item["selection_objective"], item["anygrasp_score"]),
         reverse=True,
     )
-    selected = accepted[0]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "plan_type": "xarm7_anygrasp_pick",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "robot_ip": config["robot_ip"],
@@ -330,9 +321,9 @@ def build_plan(
         },
         "tool_alignment_verified": config.get("tool_alignment_verified") is True,
         "ready": ready,
-        "selected": selected,
-        "accepted_candidate_count": len(accepted),
-        "rejected": rejected,
+        "selection_method": "selection_objective_desc_then_collision_free",
+        "ranked_candidates": accepted,
+        "candidate_count": len(accepted),
         "workspace_m": config["workspace_m"].tolist(),
         "minimum_transit_z_m": _number(config, "minimum_transit_z_m"),
         "limitations": [
@@ -343,6 +334,54 @@ def build_plan(
             "Full execution is blocked until tool alignment is visually verified.",
         ],
     }
+
+
+def _ranked_plan_candidates(plan: Mapping[str, Any]) -> Sequence[Dict[str, Any]]:
+    if plan.get("selection_method") != (
+        "selection_objective_desc_then_collision_free"
+    ):
+        raise RobotExecutionError(
+            "robot plan selection method is invalid; rebuild robot-plan"
+        )
+    candidates = plan.get("ranked_candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise RobotExecutionError(
+            "robot plan has no score-ranked candidates; rebuild robot-plan"
+        )
+    validated = []
+    previous_key: Optional[tuple[float, float]] = None
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise RobotExecutionError("robot plan contains an invalid candidate")
+        waypoints = candidate.get("waypoints")
+        if not isinstance(waypoints, dict):
+            raise RobotExecutionError("robot plan candidate has no waypoints")
+        for name in ("pregrasp", "grasp", "retreat", "lift"):
+            if name not in waypoints:
+                raise RobotExecutionError(
+                    f"robot plan candidate has no {name} waypoint"
+                )
+            validate_transform(
+                np.asarray(waypoints[name], dtype=np.float64), name
+            )
+        try:
+            key = (
+                float(candidate["selection_objective"]),
+                float(candidate["anygrasp_score"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RobotExecutionError(
+                "robot plan candidate has an invalid score"
+            ) from exc
+        if not np.all(np.isfinite(key)):
+            raise RobotExecutionError("robot plan candidate score is not finite")
+        if previous_key is not None and key > previous_key:
+            raise RobotExecutionError(
+                "robot plan candidates are not sorted by descending score"
+            )
+        previous_key = key
+        validated.append(candidate)
+    return validated
 
 
 def _load_existing_plan(path: Path, config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -370,17 +409,7 @@ def _load_existing_plan(path: Path, config: Mapping[str, Any]) -> Dict[str, Any]
                 f"{name.replace('_', ' ')} changed after plan generation; "
                 "rebuild robot-plan"
             )
-    selected = plan.get("selected")
-    if not isinstance(selected, dict) or not isinstance(
-        selected.get("waypoints"), dict
-    ):
-        raise RobotExecutionError("existing robot plan has no selected waypoints")
-    for name in ("pregrasp", "grasp", "retreat", "lift"):
-        if name not in selected["waypoints"]:
-            raise RobotExecutionError(f"existing robot plan has no {name} waypoint")
-        validate_transform(
-            np.asarray(selected["waypoints"][name], dtype=np.float64), name
-        )
+    _ranked_plan_candidates(plan)
     _plan_ready(plan, config)
     return plan
 
@@ -412,6 +441,14 @@ def _load_collision_approval(
     if validation.get("source_robot_config_sha256") != _sha256_file(config_path):
         raise RobotExecutionError(
             "robot config changed after collision validation; rebuild and validate again"
+        )
+    selected = validation.get("selected")
+    plan = load_json_object(plan_path)
+    if not isinstance(selected, dict) or not any(
+        selected == candidate for candidate in _ranked_plan_candidates(plan)
+    ):
+        raise RobotExecutionError(
+            "collision validation did not select a candidate from this robot plan"
         )
     timestamp = validation.get("validated_at")
     if not isinstance(timestamp, str):
@@ -764,7 +801,18 @@ def execute_plan(
                 "full grasp is blocked until the pregrasp orientation is visually "
                 "checked and tool_alignment_verified is set to true"
             )
-        waypoints = plan["selected"]["waypoints"]
+        if collision_validation is None:
+            raise RobotExecutionError(
+                "collision validation did not provide a selected candidate"
+            )
+        selected = collision_validation.get("selected")
+        if not isinstance(selected, dict) or not isinstance(
+            selected.get("waypoints"), dict
+        ):
+            raise RobotExecutionError(
+                "collision validation has no selected candidate waypoints"
+            )
+        waypoints = selected["waypoints"]
         grasp = validate_transform(np.asarray(waypoints["grasp"]))
         if (
             mode in {"grasp-check", "full"}
@@ -788,7 +836,7 @@ def execute_plan(
 
         _check_code(
             arm,
-            int(arm.set_collision_sensitivity(5)),
+            int(arm.set_collision_sensitivity(3)),
             "collision sensitivity",
         )
         self_collision_code = arm.set_self_collision_detection(True)
@@ -946,12 +994,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             plan_path = output_path
 
         if arguments.mode == "plan":
+            candidates = _ranked_plan_candidates(plan)
             print(
                 json.dumps(
                     {
                         "plan": str(plan_path),
                         "ready": plan["ready"],
-                        "selected": plan["selected"],
+                        "selection_method": plan["selection_method"],
+                        "candidate_count": len(candidates),
+                        "top_score_candidate": candidates[0],
                     },
                     indent=2,
                 )

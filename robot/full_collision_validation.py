@@ -36,6 +36,7 @@ from .xarm_grasp_execution import (
     _load_config,
     _number,
     _plan_ready,
+    _ranked_plan_candidates,
     _rotation_to_rpy,
     _sha256_file,
 )
@@ -229,13 +230,19 @@ def _query_ik_path(
     arm: Any,
     targets: Sequence[Dict[str, Any]],
     maximum_joint_step_rad: float,
+    initial_angles: Optional[Sequence[float]] = None,
 ) -> Sequence[Dict[str, Any]]:
-    code, current_angles = arm.get_servo_angle(is_radian=True)
-    if code != 0 or len(current_angles) < 7:
-        raise CollisionValidationError(
-            f"could not read current xArm joint angles, code={code}"
-        )
-    previous = np.asarray(current_angles[:7], dtype=np.float64)
+    if initial_angles is None:
+        code, current_angles = arm.get_servo_angle(is_radian=True)
+        if code != 0 or len(current_angles) < 7:
+            raise CollisionValidationError(
+                f"could not read current xArm joint angles, code={code}"
+            )
+        previous = np.asarray(current_angles[:7], dtype=np.float64)
+    else:
+        previous = np.asarray(initial_angles, dtype=np.float64)
+        if previous.shape != (7,) or not np.all(np.isfinite(previous)):
+            raise CollisionValidationError("initial IK joint state is invalid")
     results = []
     for index, sample in enumerate(targets):
         target = sample["target"]
@@ -638,12 +645,20 @@ def validate_collision(
         raise CollisionValidationError(
             "robot config changed after plan generation; rebuild robot-plan"
         )
-    selected = plan.get("selected")
-    if not isinstance(selected, dict) or not isinstance(selected.get("waypoints"), dict):
-        raise CollisionValidationError("robot plan has no selected waypoints")
+    candidates = _ranked_plan_candidates(plan)
     config = _load_config(config_path)
     ready = _plan_ready(plan, config)
     settings = _collision_config(config_path)
+    urdf_path, srdf_path = _generate_urdf(
+        xarm_root,
+        output_path.with_name("xarm7_gripper_collision.urdf"),
+        bool(dict(load_json_object(config_path)).get("xarm_model1300", True)),
+        str(dict(load_json_object(config_path)).get("xarm_gripper_version", "G1")),
+    )
+    evaluated_candidate_count = 0
+    collision_tested_candidate_count = 0
+    selected: Optional[Dict[str, Any]] = None
+    bullet_result: Optional[Dict[str, Any]] = None
     arm = _connect(config)
     try:
         status = _check_robot_status(arm, config)
@@ -656,22 +671,41 @@ def validate_collision(
         )
         ready_transform = ready_targets[-1]["target"]
         ready_sample_index = len(ready_targets) - 1
-        task_targets = _path_targets(
-            ready_transform,
-            selected["waypoints"],
-            settings["linear_sample_step_m"],
-            settings["angular_sample_step_deg"],
-            start_name="ready",
-        )
-        targets = [*ready_targets, *task_targets[1:]]
-        samples = _query_ik_path(
+        ready_samples = _query_ik_path(
             arm,
-            targets,
+            ready_targets,
             _number(config, "maximum_joint_step_rad"),
         )
         resolved_ready_joints = np.asarray(
-            samples[ready_sample_index]["joints"], dtype=np.float64
+            ready_samples[ready_sample_index]["joints"], dtype=np.float64
         )
+        for candidate in candidates:
+            evaluated_candidate_count += 1
+            task_targets = _path_targets(
+                ready_transform,
+                candidate["waypoints"],
+                settings["linear_sample_step_m"],
+                settings["angular_sample_step_deg"],
+                start_name="ready",
+            )
+            try:
+                task_samples = _query_ik_path(
+                    arm,
+                    task_targets,
+                    _number(config, "maximum_joint_step_rad"),
+                    initial_angles=resolved_ready_joints,
+                )
+            except CollisionValidationError:
+                continue
+            samples = [*ready_samples, *task_samples[1:]]
+            collision_tested_candidate_count += 1
+            candidate_result = _run_bullet(
+                urdf_path, srdf_path, samples, settings
+            )
+            if candidate_result["modeled_collision_check_passed"] is True:
+                selected = dict(candidate)
+                bullet_result = candidate_result
+                break
     finally:
         arm.disconnect()
 
@@ -679,24 +713,36 @@ def validate_collision(
         np.linalg.norm(ready_transform[:3, 3] - current[:3, 3])
     )
     initial_distance_ok = initial_distance <= _number(config, "maximum_initial_move_m")
-    urdf_path, srdf_path = _generate_urdf(
-        xarm_root,
-        output_path.with_name("xarm7_gripper_collision.urdf"),
-        bool(dict(load_json_object(config_path)).get("xarm_model1300", True)),
-        str(dict(load_json_object(config_path)).get("xarm_gripper_version", "G1")),
-    )
-    bullet_result = _run_bullet(urdf_path, srdf_path, samples, settings)
-    modeled_passed = bool(bullet_result["modeled_collision_check_passed"])
-    grasp = validate_transform(
-        np.asarray(selected["waypoints"]["grasp"]), "grasp"
-    )
-    tabletop_execution_required = bool(
-        float(grasp[2, 3]) < _number(config, "minimum_transit_z_m")
-    )
-    tabletop_execution_verified = bool(
-        not tabletop_execution_required
-        or config.get("tabletop_execution_verified") is True
-    )
+    modeled_passed = selected is not None and bullet_result is not None
+    if selected is None or bullet_result is None:
+        tabletop_execution_required: Optional[bool] = None
+        tabletop_execution_verified = False
+        bullet_result = {
+            "modeled_collision_check_passed": False,
+            "sample_count": 0,
+            "maximum_nominal_urdf_tcp_error_m": None,
+            "maximum_allowed_model_error_m": settings["maximum_model_error_m"],
+            "minimum_full_link_table_clearance_m": None,
+            "minimum_full_link_table_clearance_context": None,
+            "minimum_gripper_table_clearance_m": None,
+            "minimum_gripper_table_clearance_context": None,
+            "minimum_self_clearance_m": None,
+            "minimum_self_clearance_context": None,
+            "collision_count": None,
+            "collisions": [],
+            "samples": [],
+        }
+    else:
+        grasp = validate_transform(
+            np.asarray(selected["waypoints"]["grasp"]), "grasp"
+        )
+        tabletop_execution_required = bool(
+            float(grasp[2, 3]) < _number(config, "minimum_transit_z_m")
+        )
+        tabletop_execution_verified = bool(
+            not tabletop_execution_required
+            or config.get("tabletop_execution_verified") is True
+        )
     safe_for_execution = bool(
         modeled_passed
         and initial_distance_ok
@@ -712,9 +758,11 @@ def validate_collision(
         raise CollisionValidationError(
             "robot config changed while collision validation was running"
         )
-    start_joints = bullet_result.get("samples", [{}])[0].get("joints_rad")
+    start_joints = np.asarray(
+        ready_samples[0]["joints"], dtype=np.float64
+    ).tolist()
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "validation_type": "xarm7_full_link_table_collision",
         "validation_status": "completed",
         "validated_at": datetime.now(timezone.utc).isoformat(),
@@ -727,6 +775,14 @@ def validate_collision(
         "robot_status": status,
         "robot_start_joints_rad": start_joints,
         "ready": plan["ready"],
+        "selection_method": plan["selection_method"],
+        "candidate_count": len(candidates),
+        "evaluated_candidate_count": evaluated_candidate_count,
+        "collision_tested_candidate_count": collision_tested_candidate_count,
+        "selected": selected,
+        "selected_candidate_index": (
+            None if selected is None else selected["candidate_index"]
+        ),
         "resolved_ready_joint_angles_rad": resolved_ready_joints.tolist(),
         "resolved_ready_joint_angles_deg": np.rad2deg(
             resolved_ready_joints
@@ -756,7 +812,7 @@ def validate_collision(
             for condition, reason in (
                 (
                     not modeled_passed,
-                    "modeled full-link/table collision validation did not pass",
+                    "no score-ranked candidate passed full collision validation",
                 ),
                 (
                     not initial_distance_ok,
@@ -771,7 +827,7 @@ def validate_collision(
                     "tool alignment has not been physically verified",
                 ),
                 (
-                    not tabletop_execution_verified,
+                    selected is not None and not tabletop_execution_verified,
                     "tabletop gripper clearance has not been physically verified",
                 ),
             )
@@ -817,7 +873,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _write_json(
             output_path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "validation_type": "xarm7_full_link_table_collision",
                 "validation_status": "running",
                 "validation_started_at": started_at,
@@ -833,6 +889,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         summary = {
             "output": str(output_path),
+            "selection_method": result["selection_method"],
+            "candidate_count": result["candidate_count"],
+            "evaluated_candidate_count": result["evaluated_candidate_count"],
+            "selected_candidate_index": result["selected_candidate_index"],
             "modeled_collision_check_passed": result[
                 "modeled_collision_check_passed"
             ],
@@ -862,7 +922,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _write_json(
                 output_path,
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "validation_type": "xarm7_full_link_table_collision",
                     "validation_status": "failed",
                     "validation_started_at": started_at,
