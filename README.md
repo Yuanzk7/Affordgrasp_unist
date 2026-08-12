@@ -8,15 +8,51 @@ RGB-D 촬영 → ICAR 추론 → VLPart 객체·부위 분할 → AnyGrasp
            → 로봇 경로 생성 → IK·충돌 검증 → xArm7 실행
 ```
 
-## 요구 사항
+## 실행 환경과 라이브러리
 
-- Linux, Bash, Python, Conda
-- Intel RealSense D435
-- ICAR에 사용할 Gemini 또는 OpenAI API
-- VLPart 소스, checkpoint, 실행 환경
-- AnyGrasp SDK, license, checkpoint, 실행 환경
-- 로봇 실행 시 xArm7, xArm Gripper, `xarm_ros2`, eye-to-hand 캘리브레이션
+기본 요구 사항은 Linux, Bash, Python 3.9 이상, Conda와 Intel RealSense
+D435다. GPU 실행에는 사용할 PyTorch와 호환되는 NVIDIA driver, CUDA,
+MinkowskiEngine 빌드가 필요하다.
 
+`run_affordgrasp_pipeline.sh`는 단계별로 다른 Python 환경을 사용한다.
+
+| 실행 환경 | 단계 | 필수 패키지·라이브러리 |
+|---|---|---|
+| 현재 셸의 Python | RGB-D 촬영, ICAR, 캘리브레이션 | `numpy`, `Pillow`, `opencv-contrib-python`, `pyrealsense2`, `openai` |
+| `AFFORDGRASP_VLPART_ENV` | object localization, affordance mask | PyTorch, torchvision, Detectron2, CLIP, VLPart `requirements.txt` |
+| `AFFORDGRASP_ANYGRASP_ENV` | grasp pose, robot plan·실행 | AnyGrasp SDK/`gsnet`, PyTorch, MinkowskiEngine, NumPy, Pillow, OpenCV, Open3D, SciPy, Matplotlib |
+| `AFFORDGRASP_ANYGRASP_ENV` | 로봇 연결, 충돌 검증 | `xarm-python-sdk`, `pybullet`, `xacro`, `xarm_ros2` 모델 |
+
+현재 셸에서 사용하는 기본 Python 패키지는 다음과 같이 설치할 수 있다.
+
+```bash
+python -m pip install \
+  numpy Pillow openai pyrealsense2 opencv-contrib-python
+```
+
+- `opencv-contrib-python`은 `cv2`와 ChArUco/`aruco` 기능을 함께 제공한다.
+  같은 환경에 `opencv-python`과 중복 설치하지 않는다.
+- Gemini provider도 OpenAI 호환 API를 사용하므로 `openai` 패키지가
+  필요하다. `google-genai`는 필요하지 않다.
+- D435 사용 전에 Intel `librealsense` runtime과 udev 규칙을 운영체제에
+  설정한다. `pyrealsense2`는 이 runtime의 Python binding이다.
+- VLPart는 해당 저장소의 `requirements.txt`와 Detectron2를 PyTorch/CUDA
+  조합에 맞게 설치한다.
+- AnyGrasp는 SDK에 포함된 requirements, 컴파일 확장, license 등록 절차를
+  따른다. `gsnet`을 별도의 동명 PyPI 패키지로 대체하지 않는다.
+- AnyGrasp 환경에는 시각화와 로봇 단계용 패키지를 추가한다.
+  로봇을 사용하지 않으면 `xarm-python-sdk`, `pybullet`, `xacro`는 생략할
+  수 있다.
+
+```bash
+source ./config.env
+conda run --prefix "$AFFORDGRASP_ANYGRASP_ENV" \
+  python -m pip install matplotlib xarm-python-sdk pybullet xacro
+```
+
+`xarm_ros2`는 pip 패키지가 아니라 충돌 모델에 사용하는 소스 트리다.
+기본 경로는 `./xarm_ros2`이며 다른 위치는 `AFFORDGRASP_XARM_ROS2_ROOT`로
+지정한다.
 각 외부 프로젝트와 장치 드라이버를 먼저 설치한 뒤 경로를 `config.env`에
 설정한다.
 
