@@ -16,9 +16,14 @@ conda activate anygrasp
 export GEMINI_API_KEY="발급받은_API_KEY"
 ```
 
-로컬 설치 경로는 [config.env](config.env), 로봇과 안전 설정은
+[`config.env.example`](config.env.example)을 `config.env`로 복사한 뒤 로컬
+설치 경로와 로봇 주소를 설정한다. 로봇과 안전 설정은
 [robot_config.json](robot_config.json)에서 관리한다. API 키는 파일에 저장하지
 않는다.
+
+```bash
+cp config.env.example config.env
+```
 
 필수 구성:
 
