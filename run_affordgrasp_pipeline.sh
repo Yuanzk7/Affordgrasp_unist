@@ -15,7 +15,6 @@ usage() {
                ./run_affordgrasp_pipeline.sh --stage localization 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage mask 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage grasp 촬영_prefix
-               ./run_affordgrasp_pipeline.sh --stage camera-sim 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage robot-plan 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage robot-collision 촬영_prefix
                ./run_affordgrasp_pipeline.sh --stage robot-execute [승인 옵션] 촬영_prefix
@@ -110,7 +109,7 @@ case $PIPELINE_STAGE in
     PIPELINE_INSTRUCTION=$1
     PIPELINE_PREFIX=$2
     ;;
-  localization | mask | grasp | camera-sim | robot-plan | robot-collision | robot-execute)
+  localization | mask | grasp | robot-plan | robot-collision | robot-execute)
     [[ $# -eq 1 ]] || usage
     PIPELINE_PREFIX=$1
     ;;
@@ -164,10 +163,6 @@ PIPELINE_ROBOT_CONFIG=${AFFORDGRASP_ROBOT_CONFIG:-$PIPELINE_PROJECT_DIR/robot_co
 PIPELINE_EYE_TO_HAND_CALIBRATION=${AFFORDGRASP_EYE_TO_HAND_CALIBRATION:-$PIPELINE_PROJECT_DIR/calibration/eye_to_hand.json}
 PIPELINE_XARM_ROS2_ROOT=${AFFORDGRASP_XARM_ROS2_ROOT:-$PIPELINE_PROJECT_DIR/xarm_ros2}
 PIPELINE_COLLISION_MAX_AGE=${AFFORDGRASP_COLLISION_VALIDATION_MAX_AGE_SECONDS:-300}
-PIPELINE_SIM_PREGRASP_OFFSET=${AFFORDGRASP_SIM_PREGRASP_OFFSET:-0.12}
-PIPELINE_SIM_RETREAT_OFFSET=${AFFORDGRASP_SIM_RETREAT_OFFSET:-0.12}
-PIPELINE_SIM_LIFT_OFFSET=${AFFORDGRASP_SIM_LIFT_OFFSET:-0.08}
-PIPELINE_SIM_MAX_VIS_POINTS=${AFFORDGRASP_SIM_MAX_VIS_POINTS:-15000}
 
 PIPELINE_CAPTURE_DIR=${AFFORDGRASP_CAPTURE_DIR:-$PIPELINE_PROJECT_DIR/captures/icar_d435}
 PIPELINE_RUN_ROOT=${AFFORDGRASP_RUN_ROOT:-$PIPELINE_PROJECT_DIR/runs}
@@ -176,7 +171,6 @@ PIPELINE_JSON_DIR=$PIPELINE_RUN_DIR/json
 PIPELINE_LOCALIZATION_DIR=$PIPELINE_RUN_DIR/object_localization
 PIPELINE_MASK_DIR=$PIPELINE_RUN_DIR/affordance_mask
 PIPELINE_GRASP_DIR=$PIPELINE_RUN_DIR/grasp
-PIPELINE_CAMERA_SIM_DIR=$PIPELINE_RUN_DIR/camera_simulation
 PIPELINE_ROBOT_DIR=$PIPELINE_RUN_DIR/robot
 PIPELINE_RGB_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_rgb.png
 PIPELINE_DEPTH_IMAGE=$PIPELINE_CAPTURE_DIR/${PIPELINE_PREFIX}_depth_${PIPELINE_GRASP_DEPTH_SOURCE}.png
@@ -372,44 +366,6 @@ run_grasp() {
   fi
 }
 
-run_camera_sim() {
-  require_file "$PIPELINE_GRASP_DIR/grasp_pose_result.json" \
-    "Grasp Pose Generation 결과가 없습니다"
-
-  local sim_mpl_cache=$PIPELINE_CAMERA_SIM_DIR/.matplotlib
-  local sim_xdg_cache=$PIPELINE_CAMERA_SIM_DIR/.cache
-  mkdir -p "$sim_mpl_cache" "$sim_xdg_cache"
-  local -a simulation_command=(
-    python -m affordgrasp_icar.grasp.camera_simulation
-    --grasp-result "$PIPELINE_GRASP_DIR/grasp_pose_result.json"
-    --output-dir "$PIPELINE_CAMERA_SIM_DIR"
-    --pregrasp-offset "$PIPELINE_SIM_PREGRASP_OFFSET"
-    --retreat-offset "$PIPELINE_SIM_RETREAT_OFFSET"
-    --lift-offset "$PIPELINE_SIM_LIFT_OFFSET"
-    --max-gripper-width "$PIPELINE_MAX_GRIPPER_WIDTH"
-    --max-vis-points "$PIPELINE_SIM_MAX_VIS_POINTS"
-  )
-
-  if [[ -n $PIPELINE_ANYGRASP_ENV ]]; then
-    if ! command -v conda >/dev/null 2>&1; then
-      echo "conda 명령을 찾을 수 없습니다." >&2
-      exit 2
-    fi
-    if [[ ! -d $PIPELINE_ANYGRASP_ENV ]]; then
-      echo "Camera simulation에 사용할 Conda 환경이 없습니다: $PIPELINE_ANYGRASP_ENV" >&2
-      exit 2
-    fi
-    MPLCONFIGDIR="$sim_mpl_cache" \
-    XDG_CACHE_HOME="$sim_xdg_cache" \
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. \
-    conda run --prefix "$PIPELINE_ANYGRASP_ENV" "${simulation_command[@]}"
-  else
-    MPLCONFIGDIR="$sim_mpl_cache" \
-    XDG_CACHE_HOME="$sim_xdg_cache" \
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.. "${simulation_command[@]}"
-  fi
-}
-
 run_robot_plan() {
   require_file "$PIPELINE_GRASP_DIR/grasp_pose_result.json" \
     "AnyGrasp 결과가 없습니다"
@@ -492,7 +448,6 @@ mkdir -p \
   "$PIPELINE_LOCALIZATION_DIR" \
   "$PIPELINE_MASK_DIR" \
   "$PIPELINE_GRASP_DIR" \
-  "$PIPELINE_CAMERA_SIM_DIR" \
   "$PIPELINE_ROBOT_DIR"
 
 case $PIPELINE_STAGE in
@@ -506,7 +461,6 @@ case $PIPELINE_STAGE in
     run_localization
     run_mask
     run_grasp
-    run_camera_sim
     if $PIPELINE_EXECUTE; then
       run_robot_plan
       run_robot_collision
@@ -528,9 +482,6 @@ case $PIPELINE_STAGE in
     printf 'Grasp 3D: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
     printf 'Scene point cloud: %s\n' "$PIPELINE_GRASP_DIR/scene_point_cloud.ply"
     printf 'Affordance point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
-    printf 'Camera trajectory JSON: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.json"
-    printf 'Camera trajectory 3D: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory_3d.png"
-    printf 'Camera trajectory GIF: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.gif"
     if $PIPELINE_EXECUTE; then
       printf 'Robot plan: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan.json"
       printf 'Collision validation: %s\n' "$PIPELINE_ROBOT_DIR/collision_validation.json"
@@ -563,14 +514,6 @@ case $PIPELINE_STAGE in
     printf '3D visualization: %s\n' "$PIPELINE_GRASP_DIR/grasp_pose_3d.png"
     printf 'Scene point cloud: %s\n' "$PIPELINE_GRASP_DIR/scene_point_cloud.ply"
     printf 'Affordance point cloud: %s\n' "$PIPELINE_GRASP_DIR/affordance_point_cloud.ply"
-    ;;
-  camera-sim)
-    run_camera_sim
-    printf '카메라 좌표계 grasp 경로 시뮬레이션 완료\n'
-    printf 'Trajectory: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.json"
-    printf '3D visualization: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory_3d.png"
-    printf 'Animation: %s\n' "$PIPELINE_CAMERA_SIM_DIR/camera_trajectory.gif"
-    printf '이 단계는 eye-to-hand 행렬이나 로봇 연결을 사용하지 않습니다.\n'
     ;;
   robot-plan)
     run_robot_plan

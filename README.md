@@ -34,7 +34,7 @@ cp config.env.example config.env
 
 ## 실행
 
-인식과 카메라 좌표 시뮬레이션까지만 실행:
+촬영부터 grasp pose 생성까지만 실행:
 
 ```bash
 ./run_affordgrasp_pipeline.sh \
@@ -73,7 +73,6 @@ cp config.env.example config.env
 ./run_affordgrasp_pipeline.sh --stage localization run01_pliers
 ./run_affordgrasp_pipeline.sh --stage mask run01_pliers
 ./run_affordgrasp_pipeline.sh --stage grasp run01_pliers
-./run_affordgrasp_pipeline.sh --stage camera-sim run01_pliers
 ./run_affordgrasp_pipeline.sh --stage robot-plan run01_pliers
 ./run_affordgrasp_pipeline.sh --stage robot-collision run01_pliers
 ```
@@ -84,7 +83,6 @@ cp config.env.example config.env
 | `localization` | VLPart 후보 중 대상 물체 선택 |
 | `mask` | 잡을 부분의 mask 생성 |
 | `grasp` | RGB-D와 mask로 AnyGrasp 후보 생성 |
-| `camera-sim` | 카메라 좌표계 grasp 경로 시각화 |
 | `robot-plan` | 후보를 xArm base 경로로 변환하고 점수순 정렬 |
 | `robot-collision` | 점수순으로 IK와 전체 링크 충돌 검사 후 최종 후보 선택 |
 | `robot-execute` | 검증된 최종 후보만 실제 실행 |
@@ -114,7 +112,6 @@ runs/<prefix>/
 ├── object_localization/   객체 후보와 선택 결과
 ├── affordance_mask/       mask와 overlay
 ├── grasp/                 grasp pose와 point cloud
-├── camera_simulation/     경로 JSON, PNG, GIF
 └── robot/                 robot plan, 충돌 검증, 실행 기록
 ```
 
@@ -123,8 +120,7 @@ runs/<prefix>/
 1. `selected_object_overlay.png`: 올바른 물체인지 확인
 2. `affordance_overlay.png`: 잡을 영역이 맞는지 확인
 3. `grasp_pose_3d.png`: gripper 자세 확인
-4. `camera_trajectory.gif`: 접근·후퇴 경로 확인
-5. `collision_validation.json`: `safe_for_execution` 확인
+4. `collision_validation.json`: `safe_for_execution` 확인
 
 거리 계산에는 preview가 아니라 `uint16` raw/filtered depth를 사용한다.
 
