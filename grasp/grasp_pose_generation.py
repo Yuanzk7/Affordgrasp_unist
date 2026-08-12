@@ -431,11 +431,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=20_000,
         help="3D PNG에 표시할 최대 point 수",
     )
-    parser.add_argument(
-        "--vis",
-        action="store_true",
-        help="호환성 옵션; grasp 3D PNG는 추론 시 항상 저장됨",
-    )
     return parser
 
 
