@@ -1,178 +1,140 @@
-# AffordGrasp 파이프라인
+# AffordGrasp
 
-RealSense D435 영상에서 작업 대상과 잡을 부분을 찾고, AnyGrasp grasp pose를
-xArm7 집기 동작으로 연결하는 프로젝트다.
+AffordGrasp는 RGB-D 영상과 자연어 작업 지시로부터 대상 물체와 잡을 부위를
+찾고, AnyGrasp 후보를 생성해 xArm7 집기 동작으로 연결하는 파이프라인이다.
 
 ```text
-D435 → ICAR → VLPart → Affordance mask → AnyGrasp
-     → xArm7 plan → IK·충돌 검증 → xArm Gripper
+RGB-D 촬영 → ICAR 추론 → VLPart 객체·부위 분할 → AnyGrasp
+           → 로봇 경로 생성 → IK·충돌 검증 → xArm7 실행
 ```
 
-## 준비
+## 요구 사항
 
-```bash
-cd /home/unist/Test_hand/affordgrasp_icar
-conda activate anygrasp
-export GEMINI_API_KEY="발급받은_API_KEY"
-```
+- Linux, Bash, Python, Conda
+- Intel RealSense D435
+- ICAR에 사용할 Gemini 또는 OpenAI API
+- VLPart 소스, checkpoint, 실행 환경
+- AnyGrasp SDK, license, checkpoint, 실행 환경
+- 로봇 실행 시 xArm7, xArm Gripper, `xarm_ros2`, eye-to-hand 캘리브레이션
 
-[`config.env.example`](config.env.example)을 `config.env`로 복사한 뒤 로컬
-설치 경로와 로봇 주소를 설정한다. 로봇과 안전 설정은
-[robot_config.json](robot_config.json)에서 관리한다. API 키는 파일에 저장하지
-않는다.
+각 외부 프로젝트와 장치 드라이버를 먼저 설치한 뒤 경로를 `config.env`에
+설정한다.
+
+## 설정
+
+저장소 루트에서 예시 파일을 로컬 설정으로 복사한다.
 
 ```bash
 cp config.env.example config.env
+cp robot_config.example.json robot_config.json
 ```
 
-필수 구성:
+- [`config.env.example`](config.env.example): API provider, 모델, checkpoint, Conda 환경,
+  로봇 주소 등 머신별 설정
+- [`robot_config.example.json`](robot_config.example.json): 작업 공간, 관절·TCP 제한,
+  테이블 기하, 이동 속도 등 로봇 안전 설정
 
-- Intel RealSense D435
-- VLPart 모델과 환경
-- AnyGrasp SDK, 라이선스, checkpoint와 환경
-- xArm7, xArm Gripper와 eye-to-hand 캘리브레이션
+`config.env`와 `robot_config.json`은 Git에 커밋하지 않는다. API 키도 설정
+파일에 저장하지 말고 실행 셸의 환경변수로 제공한다.
 
-## 실행
+```bash
+export GEMINI_API_KEY="your-api-key"
+# 또는
+export OPENAI_API_KEY="your-api-key"
+```
 
-촬영부터 grasp pose 생성까지만 실행:
+## 기본 실행
+
+아래 명령은 새 RGB-D 프레임을 촬영하고 grasp pose까지 생성한다.
+로봇은 연결하거나 움직이지 않는다.
 
 ```bash
 ./run_affordgrasp_pipeline.sh \
-  "I need to pick up the pliers safely." run01_pliers
+  "Pick up the mug by its handle." demo_mug
 ```
 
-촬영부터 실제 집기까지 실행:
+마지막 인자는 촬영과 결과를 구분할 prefix다. 영문자·숫자로 시작하고
+영문자, 숫자, `.`, `_`, `-`만 사용할 수 있다.
+
+### 단계 재실행
+
+`--stage`는 새로 촬영하지 않고 같은 prefix의 기존 입력과 결과를 사용한다.
 
 ```bash
-./run_affordgrasp_pipeline.sh --execute \
-  --robot-mode full \
-  --confirm MOVE_XARM7_192_168_1_216 \
-  --acknowledge-cleared-workspace \
-  --acknowledge-estop-ready \
-  "I need to pick up the pliers safely." run01_pliers
-```
-
-처음에는 그리퍼를 닫지 않는 `grasp-check` 모드로 높이와 방향을 확인한다.
-
-```bash
-./run_affordgrasp_pipeline.sh --execute \
-  --robot-mode grasp-check \
-  --confirm MOVE_XARM7_192_168_1_216 \
-  --acknowledge-cleared-workspace \
-  --acknowledge-estop-ready \
-  "I need to pick up the pliers safely." check01_pliers
-```
-
-같은 prefix를 다시 사용하면 기존 결과가 바뀔 수 있다. 실제 실행 전에는 작업
-영역을 비우고 비상정지를 준비한다.
-
-## 단계별 실행
-
-```bash
-./run_affordgrasp_pipeline.sh --stage icar "새 작업 지시" run01_pliers
-./run_affordgrasp_pipeline.sh --stage localization run01_pliers
-./run_affordgrasp_pipeline.sh --stage mask run01_pliers
-./run_affordgrasp_pipeline.sh --stage grasp run01_pliers
-./run_affordgrasp_pipeline.sh --stage robot-plan run01_pliers
-./run_affordgrasp_pipeline.sh --stage robot-collision run01_pliers
+./run_affordgrasp_pipeline.sh --stage icar "Pick up the mug." demo_mug
+./run_affordgrasp_pipeline.sh --stage localization demo_mug
+./run_affordgrasp_pipeline.sh --stage mask demo_mug
+./run_affordgrasp_pipeline.sh --stage grasp demo_mug
+./run_affordgrasp_pipeline.sh --stage robot-plan demo_mug
+./run_affordgrasp_pipeline.sh --stage robot-collision demo_mug
 ```
 
 | 단계 | 기능 |
 |---|---|
-| `icar` | 작업 지시에서 object, part, affordance 추론 |
-| `localization` | VLPart 후보 중 대상 물체 선택 |
-| `mask` | 잡을 부분의 mask 생성 |
+| `icar` | 작업 지시에서 대상, 부위, affordance 추론 |
+| `localization` | VLPart 후보에서 대상 물체 선택 |
+| `mask` | 잡을 부위의 mask 생성 |
 | `grasp` | RGB-D와 mask로 AnyGrasp 후보 생성 |
-| `robot-plan` | 후보를 xArm base 경로로 변환하고 점수순 정렬 |
-| `robot-collision` | 점수순으로 IK와 전체 링크 충돌 검사 후 최종 후보 선택 |
-| `robot-execute` | 검증된 최종 후보만 실제 실행 |
+| `robot-plan` | grasp 후보를 로봇 base 좌표계 경로로 변환 |
+| `robot-collision` | IK와 전체 링크 충돌 검증 |
+| `robot-execute` | 검증된 plan 실행 |
 
-실제 실행만 다시 수행할 때:
+## 로봇 실행
+
+로봇 실행 전에 캘리브레이션과 `robot_config.json`의 기하·제한값을 실제
+설치와 맞게 검증해야 한다. 처음에는 그리퍼를 닫지 않는 `grasp-check`
+모드로 자세와 높이를 확인한다.
 
 ```bash
-./run_affordgrasp_pipeline.sh --stage robot-execute \
-  --robot-mode full \
-  --confirm MOVE_XARM7_192_168_1_216 \
+source ./config.env
+CONFIRM_TOKEN="MOVE_XARM7_${AFFORDGRASP_ROBOT_IP//./_}"
+
+./run_affordgrasp_pipeline.sh --execute \
+  --robot-mode grasp-check \
+  --confirm "$CONFIRM_TOKEN" \
   --acknowledge-cleared-workspace \
   --acknowledge-estop-ready \
-  run01_pliers
+  "Pick up the mug by its handle." demo_mug_check
 ```
 
-`robot-collision`은 로봇 상태와 IK를 읽지만 움직이지 않는다. 실제 실행은
-`현재→ready→pregrasp→grasp→retreat→lift` 순서의 Cartesian 동작만 사용한다.
+`grasp-check`가 안전하게 통과한 후에만 `--robot-mode full`로 전체 집기를
+실행한다. 실행 전에는 반드시 다음을 확인한다.
+
+- 작업 공간에 사람, 케이블, 장애물이 없음
+- 비상정지 장치를 즉시 사용할 수 있음
+- TCP offset, payload, 속도, 작업 공간, 테이블 모델이 실제 설치와 일치함
+- `collision_validation.json`의 `safe_for_execution`이 `true`임
+- plan, 캘리브레이션, 로봇 설정, 시작 자세가 바뀌지 않음
+
+충돌 검증은 모델에 포함된 로봇과 테이블만 고려한다. 실제 환경의 사람과
+임시 장애물을 자동으로 보장하지 않는다.
+
+## Eye-to-hand 캘리브레이션
+
+카메라 위치가 바뀌었거나 유효한 캘리브레이션이 없으면 다시 수행한다.
+상세한 하위 명령과 옵션은 도움말에서 확인할 수 있다.
+
+```bash
+PYTHONPATH=.. python -m affordgrasp_icar.robot.eye_to_hand_calibration --help
+```
+
+카메라는 고정하고 로봇 자세를 다양하게 바꾸어 샘플을 수집한다. 생성된 행렬은
+다시 검증한 뒤 `AFFORDGRASP_EYE_TO_HAND_CALIBRATION`에서 지정한 경로에 저장한다.
 
 ## 결과
 
 ```text
-captures/icar_d435/
-└── <prefix>_rgb.png, depth_raw.png, depth_filtered.png, camera.json
-
-runs/<prefix>/
-├── json/                  ICAR 및 단계별 JSON
-├── object_localization/   객체 후보와 선택 결과
-├── affordance_mask/       mask와 overlay
-├── grasp/                 grasp pose와 point cloud
-└── robot/                 robot plan, 충돌 검증, 실행 기록
+captures/icar_d435/       RGB, raw/filtered depth, camera intrinsics
+runs/<prefix>/json/       ICAR와 단계별 JSON
+runs/<prefix>/object_localization/
+runs/<prefix>/affordance_mask/
+runs/<prefix>/grasp/      grasp pose와 point cloud
+runs/<prefix>/robot/      plan, 충돌 검증, 실행 기록
 ```
 
-주요 확인 파일:
+실제 로봇 실행 전에는 최소한 다음 결과를 확인한다.
 
-1. `selected_object_overlay.png`: 올바른 물체인지 확인
-2. `affordance_overlay.png`: 잡을 영역이 맞는지 확인
-3. `grasp_pose_3d.png`: gripper 자세 확인
-4. `collision_validation.json`: `safe_for_execution` 확인
-
-거리 계산에는 preview가 아니라 `uint16` raw/filtered depth를 사용한다.
-
-## Eye-to-hand 캘리브레이션
-
-D435 위치를 바꾸었거나 캘리브레이션 파일이 없을 때만 다시 수행한다.
-
-```bash
-PYTHONPATH=.. python -m affordgrasp_icar.robot.eye_to_hand_calibration \
-  status --robot-ip 192.168.1.216
-
-PYTHONPATH=.. python -m affordgrasp_icar.robot.eye_to_hand_calibration \
-  generate-board --output calibration/charuco_4x5.png
-
-PYTHONPATH=.. python -m affordgrasp_icar.robot.eye_to_hand_calibration \
-  capture --robot-ip 192.168.1.216
-
-PYTHONPATH=.. python -m affordgrasp_icar.robot.eye_to_hand_calibration solve
-```
-
-보드는 100% 크기로 출력해 단단하게 고정하고, 카메라는 고정한 채 로봇 자세만
-바꾸어 12장 이상 촬영한다. 결과는 `calibration/eye_to_hand.json`에 저장된다.
-
-## 로봇 실행 주의사항
-
-- xArm TCP offset은 xArm Gripper용 `[0, 0, 172, 0, 0, 0]`이어야 한다.
-- ready 자세, 작업공간, 테이블과 충돌 기준은 `robot_config.json`에서 관리한다.
-- 후보는 affordance 점수순으로 검사하며 충돌을 통과한 첫 후보만 실행한다.
-- plan, 설정, 캘리브레이션 또는 로봇 시작 자세가 바뀌면 다시 검증한다.
-- `safe_for_execution=false`이면 실행하지 않는다.
-- 실제 환경의 물체, 케이블과 사람은 시뮬레이션에 포함되지 않는다.
-
-## 자주 발생하는 오류
-
-| 오류 | 확인할 내용 |
-|---|---|
-| `found no object/part` | 물체명, 가림, mask와 촬영 구도 확인 |
-| Gemini 429/404 | API 할당량과 모델명 확인 |
-| AnyGrasp license 오류 | SDK, license와 checkpoint 경로 확인 |
-| `no AnyGrasp candidate passed...` | 물체 위치, grasp 폭, 접근 방향과 작업공간 확인 |
-| `no score-ranked candidate passed...` | 생성 후보가 모두 IK 또는 충돌 검사에서 탈락 |
-| `safe_for_execution=false` | `collision_validation.json` 확인 |
-| Controller error C31 | 실제 충돌·걸림, payload와 충돌 민감도 확인 |
-| calibration 오류 | 보드 인식, 카메라 고정과 촬영 자세 확인 |
-
-## 코드 구조
-
-```text
-affordgrasp_icar/
-├── camera.py      D435 RGB-D 촬영
-├── icar/          작업과 affordance 추론
-├── grounding/     객체 검출과 mask 생성
-├── grasp/         AnyGrasp와 3D 시각화
-└── robot/         캘리브레이션, 경로, 충돌 검증과 실행
-```
+- `selected_object_overlay.png`: 올바른 물체가 선택되었는지
+- `affordance_overlay.png`: 잡을 부위가 올바른지
+- `grasp_pose_3d.png`: gripper 자세가 타당한지
+- `collision_validation.json`: plan이 안전 검증을 통과했는지
