@@ -1,9 +1,10 @@
-"""Collect and solve fixed-D435 (eye-to-hand) calibration for an xArm7."""
+"""Run fixed-D435 (eye-to-hand) calibration for an xArm7."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,16 @@ _METHODS = {
     "andreff": cv2.CALIB_HAND_EYE_ANDREFF,
     "daniilidis": cv2.CALIB_HAND_EYE_DANIILIDIS,
 }
+
+_BOARD_SQUARES_X = 4
+_BOARD_SQUARES_Y = 5
+_BOARD_DICTIONARY = "DICT_4X4_50"
+_MARKER_TO_SQUARE_RATIO = 22.0 / 30.0
+_MIN_SAMPLES = 12
+_MIN_TRANSLATION_SPAN_M = 0.08
+_MIN_ROTATION_SPAN_DEG = 25.0
+_MAX_TRANSLATION_RMS_M = 0.01
+_MAX_ROTATION_RMS_DEG = 2.5
 
 
 def _utc_now() -> str:
@@ -484,30 +495,6 @@ def capture_sample(arguments: argparse.Namespace) -> Dict[str, Any]:
     return sample
 
 
-def read_robot_status(robot_ip: str) -> Dict[str, Any]:
-    """Read controller state without enabling motion or changing configuration."""
-
-    arm = _connect_robot(robot_ip)
-    try:
-        code, pose = arm.get_position_aa(is_radian=True)
-        if code != 0:
-            raise CalibrationError(f"xArm get_position_aa failed with code {code}")
-        return {
-            "robot_ip": robot_ip,
-            "connected": bool(arm.connected),
-            "state": int(getattr(arm, "state", -1)),
-            "mode": int(getattr(arm, "mode", -1)),
-            "error_code": int(getattr(arm, "error_code", 0)),
-            "warn_code": int(getattr(arm, "warn_code", 0)),
-            "tcp_pose_mm_rad": list(map(float, pose[:6])),
-            "tcp_offset_mm_rad": read_tcp_offset(
-                arm, CalibrationError
-            ).tolist(),
-        }
-    finally:
-        arm.disconnect()
-
-
 def _pairwise_quality(
     base_to_camera: np.ndarray,
     base_to_tcp: Sequence[np.ndarray],
@@ -669,97 +656,174 @@ def solve_calibration(arguments: argparse.Namespace) -> Dict[str, Any]:
     return result
 
 
+def _load_robot_settings(path: Path) -> Dict[str, Any]:
+    try:
+        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CalibrationError(f"could not read robot config: {path}") from exc
+    if not isinstance(payload, dict):
+        raise CalibrationError("robot config must contain a JSON object")
+    try:
+        tcp_offset = [float(value) for value in payload["required_tcp_offset_mm"]]
+        tolerance = float(payload["tcp_offset_tolerance_mm"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CalibrationError(
+            "robot config needs required_tcp_offset_mm and "
+            "tcp_offset_tolerance_mm"
+        ) from exc
+    if len(tcp_offset) != 6 or tolerance < 0.0:
+        raise CalibrationError("robot config has invalid TCP offset settings")
+    robot_ip = os.environ.get("AFFORDGRASP_ROBOT_IP") or payload.get("robot_ip")
+    if not isinstance(robot_ip, str) or not robot_ip.strip():
+        raise CalibrationError(
+            "set AFFORDGRASP_ROBOT_IP or robot_ip in robot_config.json"
+        )
+    return {
+        "robot_ip": robot_ip.strip(),
+        "required_tcp_offset_mm": tcp_offset,
+        "tcp_offset_tolerance_mm": tolerance,
+    }
+
+
+def _prepare_arguments(arguments: argparse.Namespace) -> bool:
+    if arguments.square_length_m <= 0.0:
+        raise CalibrationError("square length must be positive")
+    settings = _load_robot_settings(arguments.robot_config)
+    for name, value in settings.items():
+        setattr(arguments, name, value)
+
+    arguments.squares_x = _BOARD_SQUARES_X
+    arguments.squares_y = _BOARD_SQUARES_Y
+    arguments.marker_length_m = (
+        arguments.square_length_m * _MARKER_TO_SQUARE_RATIO
+    )
+    arguments.dictionary = _BOARD_DICTIONARY
+    arguments.min_charuco_corners = 8
+    arguments.warmup_frames = 30
+    arguments.max_reprojection_error_px = 2.0
+    arguments.min_samples = _MIN_SAMPLES
+    arguments.min_translation_span_m = _MIN_TRANSLATION_SPAN_M
+    arguments.min_rotation_span_deg = _MIN_ROTATION_SPAN_DEG
+    arguments.max_translation_rms_m = _MAX_TRANSLATION_RMS_M
+    arguments.max_rotation_rms_deg = _MAX_ROTATION_RMS_DEG
+    arguments.allow_low_diversity = False
+
+    board_path = arguments.board.expanduser().resolve()
+    if board_path.exists():
+        return False
+    generate_charuco_board(
+        board_path,
+        arguments.squares_x,
+        arguments.squares_y,
+        arguments.square_length_m,
+        arguments.marker_length_m,
+        arguments.dictionary,
+        pixels_per_square=300,
+        margin_pixels=100,
+    )
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    status = subparsers.add_parser("status")
-    status.add_argument("--robot-ip", default="192.168.1.216")
-
-    board = subparsers.add_parser("generate-board")
-    board.add_argument("--output", type=Path, required=True)
-    board.add_argument("--squares-x", type=int, default=4)
-    board.add_argument("--squares-y", type=int, default=5)
-    board.add_argument("--square-length-m", type=float, default=0.030)
-    board.add_argument("--marker-length-m", type=float, default=0.022)
-    board.add_argument("--dictionary", default="DICT_4X4_50")
-    board.add_argument("--pixels-per-square", type=int, default=300)
-    board.add_argument("--margin-pixels", type=int, default=100)
-
-    capture = subparsers.add_parser("capture")
-    capture.add_argument("--robot-ip", default="192.168.1.216")
-    capture.add_argument("--squares-x", type=int, default=4)
-    capture.add_argument("--squares-y", type=int, default=5)
-    capture.add_argument("--square-length-m", type=float, default=0.030)
-    capture.add_argument("--marker-length-m", type=float, default=0.022)
-    capture.add_argument("--dictionary", default="DICT_4X4_50")
-    capture.add_argument("--min-charuco-corners", type=int, default=8)
-    capture.add_argument(
-        "--samples",
+    parser = argparse.ArgumentParser(
+        description=(
+            "Capture one eye-to-hand sample. Repeat at varied robot poses; "
+            "the calibration is solved automatically after 12 samples."
+        )
+    )
+    parser.add_argument(
+        "--robot-config",
         type=Path,
-        default=Path("calibration/eye_to_hand_charuco_samples.json"),
+        default=Path(
+            os.environ.get("AFFORDGRASP_ROBOT_CONFIG", "robot_config.json")
+        ),
+        help="robot configuration containing the IP and required TCP offset",
     )
-    capture.add_argument(
-        "--image-dir", type=Path, default=Path("calibration/captures")
-    )
-    capture.add_argument("--warmup-frames", type=int, default=30)
-    capture.add_argument("--max-reprojection-error-px", type=float, default=2.0)
-    capture.add_argument(
-        "--required-tcp-offset-mm",
+    parser.add_argument(
+        "--square-length-m",
         type=float,
-        nargs=6,
-        default=[0.0, 0.0, 172.0, 0.0, 0.0, 0.0],
-        metavar=("X", "Y", "Z", "RX", "RY", "RZ"),
+        default=0.030,
+        help="measured side length of one printed ChArUco square",
     )
-    capture.add_argument("--tcp-offset-tolerance-mm", type=float, default=3.0)
-
-    solve = subparsers.add_parser("solve")
-    solve.add_argument(
+    parser.add_argument(
+        "--board",
+        type=Path,
+        default=Path("calibration/charuco_4x5.png"),
+        help="generated printable ChArUco board",
+    )
+    parser.add_argument(
         "--samples",
         type=Path,
         default=Path("calibration/eye_to_hand_charuco_samples.json"),
+        help="accumulated calibration samples",
     )
-    solve.add_argument(
-        "--output", type=Path, default=Path("calibration/eye_to_hand.json")
+    parser.add_argument(
+        "--image-dir",
+        type=Path,
+        default=Path("calibration/captures"),
+        help="captured calibration images",
     )
-    solve.add_argument("--min-samples", type=int, default=12)
-    solve.add_argument("--min-translation-span-m", type=float, default=0.08)
-    solve.add_argument("--min-rotation-span-deg", type=float, default=25.0)
-    solve.add_argument("--max-translation-rms-m", type=float, default=0.01)
-    solve.add_argument("--max-rotation-rms-deg", type=float, default=2.5)
-    solve.add_argument("--allow-low-diversity", action="store_true")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "AFFORDGRASP_EYE_TO_HAND_CALIBRATION",
+                "calibration/eye_to_hand.json",
+            )
+        ),
+        help="validated eye-to-hand calibration",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
-        if arguments.command == "status":
+        if _prepare_arguments(arguments):
             print(
                 json.dumps(
-                    read_robot_status(arguments.robot_ip),
+                    {
+                        "status": "board_created",
+                        "board": str(arguments.board.expanduser().resolve()),
+                        "next": (
+                            "Print at 100%, attach it rigidly to the robot TCP, "
+                            "then run this command again."
+                        ),
+                    },
                     ensure_ascii=False,
                     indent=2,
                 )
             )
-        elif arguments.command == "generate-board":
-            result = generate_charuco_board(
-                arguments.output.expanduser().resolve(),
-                arguments.squares_x,
-                arguments.squares_y,
-                arguments.square_length_m,
-                arguments.marker_length_m,
-                arguments.dictionary,
-                arguments.pixels_per_square,
-                arguments.margin_pixels,
+            return 0
+
+        sample = capture_sample(arguments)
+        sample_count = len(
+            _load_samples(arguments.samples.expanduser().resolve())["samples"]
+        )
+        summary: Dict[str, Any] = {
+            "status": "sample_captured",
+            "sample_index": sample["index"],
+            "sample_count": sample_count,
+        }
+        if sample_count < arguments.min_samples:
+            summary["remaining_samples"] = arguments.min_samples - sample_count
+            summary["next"] = (
+                "Move the robot to a substantially different position and "
+                "orientation, then run this command again."
             )
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        elif arguments.command == "capture":
-            sample = capture_sample(arguments)
-            print(json.dumps(sample, ensure_ascii=False, indent=2))
         else:
             result = solve_calibration(arguments)
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            summary.update(
+                {
+                    "status": "calibration_complete",
+                    "output": str(arguments.output.expanduser().resolve()),
+                    "method": result["method"],
+                    "diversity": result["diversity"],
+                    "quality": result["quality"],
+                }
+            )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     except (CalibrationError, CameraCaptureError, TransformError) as exc:
         print(f"Calibration error: {exc}", file=sys.stderr)
         return 1

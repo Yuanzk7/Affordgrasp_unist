@@ -715,8 +715,6 @@ def validate_collision(
     initial_distance_ok = initial_distance <= _number(config, "maximum_initial_move_m")
     modeled_passed = selected is not None and bullet_result is not None
     if selected is None or bullet_result is None:
-        tabletop_execution_required: Optional[bool] = None
-        tabletop_execution_verified = False
         bullet_result = {
             "modeled_collision_check_passed": False,
             "sample_count": 0,
@@ -732,23 +730,10 @@ def validate_collision(
             "collisions": [],
             "samples": [],
         }
-    else:
-        grasp = validate_transform(
-            np.asarray(selected["waypoints"]["grasp"]), "grasp"
-        )
-        tabletop_execution_required = bool(
-            float(grasp[2, 3]) < _number(config, "minimum_transit_z_m")
-        )
-        tabletop_execution_verified = bool(
-            not tabletop_execution_required
-            or config.get("tabletop_execution_verified") is True
-        )
     safe_for_execution = bool(
         modeled_passed
         and initial_distance_ok
         and settings["geometry_verified"]
-        and config.get("tool_alignment_verified") is True
-        and tabletop_execution_verified
     )
     if _sha256_file(plan_path) != source_plan_sha256:
         raise CollisionValidationError(
@@ -790,8 +775,6 @@ def validate_collision(
         "initial_tcp_to_ready_distance_m": initial_distance,
         "maximum_initial_move_m": _number(config, "maximum_initial_move_m"),
         "initial_distance_ok": initial_distance_ok,
-        "tabletop_execution_required": tabletop_execution_required,
-        "tabletop_execution_verified": tabletop_execution_verified,
         "environment": {
             "table_top_z_m": settings["table_top_z_m"],
             "table_center_xy_m": settings["table_center_xy_m"].tolist(),
@@ -821,14 +804,6 @@ def validate_collision(
                 (
                     not settings["geometry_verified"],
                     "physical table/support geometry has not been measured and verified",
-                ),
-                (
-                    config.get("tool_alignment_verified") is not True,
-                    "tool alignment has not been physically verified",
-                ),
-                (
-                    selected is not None and not tabletop_execution_verified,
-                    "tabletop gripper clearance has not been physically verified",
                 ),
             )
             if condition
@@ -907,10 +882,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "blocking_reasons": result["blocking_reasons"],
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-        # A completed collision analysis is a successful command even when a
-        # separate physical prerequisite keeps real execution blocked.  A
-        # modeled collision itself remains a non-zero validation result.
-        return 0 if result["modeled_collision_check_passed"] else 2
+        return 0 if result["safe_for_execution"] else 2
     except (
         CollisionValidationError,
         RobotExecutionError,

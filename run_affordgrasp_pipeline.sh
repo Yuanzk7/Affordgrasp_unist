@@ -7,7 +7,7 @@ usage() {
 사용법:
   인식 실행:   ./run_affordgrasp_pipeline.sh "사용자 작업 지시" 촬영_prefix
   촬영→로봇:  ./run_affordgrasp_pipeline.sh --execute \
-                 --confirm MOVE_XARM7_192_168_1_216 \
+                 --confirm MOVE_XARM7_IP_WITH_UNDERSCORES \
                  --acknowledge-cleared-workspace \
                  --acknowledge-estop-ready \
                  "사용자 작업 지시" 촬영_prefix
@@ -22,8 +22,7 @@ usage() {
 --stage 재실행은 새로 촬영하지 않고 기존 captures/ 촬영본과
 runs/<prefix>/json 결과를 사용해 해당 단계만 다시 실행한다.
 --execute는 촬영부터 full-link 충돌 검증까지 새로 수행하고, 검증을 통과한
-동일 plan을 xArm7에서 실행한다. --robot-mode는 pregrasp, grasp-check, full 중
-하나이며 기본값은 full이다.
+동일 plan을 xArm7에서 집기·후퇴·리프트까지 실행한다.
 설정은 config.env에서 읽는다.
 EOF
   exit 64
@@ -32,7 +31,6 @@ EOF
 PIPELINE_STAGE=all
 PIPELINE_STAGE_EXPLICIT=false
 PIPELINE_EXECUTE=false
-PIPELINE_ROBOT_MODE=full
 PIPELINE_CONFIRM=""
 PIPELINE_ACK_WORKSPACE=false
 PIPELINE_ACK_ESTOP=false
@@ -49,11 +47,6 @@ while [[ $# -gt 0 ]]; do
     --execute)
       PIPELINE_EXECUTE=true
       shift
-      ;;
-    --robot-mode)
-      [[ $# -ge 2 ]] || usage
-      PIPELINE_ROBOT_MODE=$2
-      shift 2
       ;;
     --confirm)
       [[ $# -ge 2 ]] || usage
@@ -95,14 +88,6 @@ if $PIPELINE_EXECUTE && $PIPELINE_STAGE_EXPLICIT; then
   echo "--execute와 --stage는 함께 사용할 수 없습니다." >&2
   usage
 fi
-case $PIPELINE_ROBOT_MODE in
-  pregrasp | grasp-check | full) ;;
-  *)
-    echo "--robot-mode는 pregrasp, grasp-check 또는 full이어야 합니다." >&2
-    usage
-    ;;
-esac
-
 case $PIPELINE_STAGE in
   all | icar)
     [[ $# -eq 2 ]] || usage
@@ -383,8 +368,7 @@ run_robot_plan() {
     --grasp-result "$PIPELINE_GRASP_DIR/grasp_pose_result.json" \
     --calibration "$PIPELINE_EYE_TO_HAND_CALIBRATION" \
     --robot-config "$PIPELINE_ROBOT_CONFIG" \
-    --output "$PIPELINE_ROBOT_DIR/robot_plan.json" \
-    --mode plan
+    --output "$PIPELINE_ROBOT_DIR/robot_plan.json"
 }
 
 run_robot_collision() {
@@ -427,7 +411,7 @@ run_robot_execute() {
     --collision-validation "$PIPELINE_ROBOT_DIR/collision_validation.json"
     --robot-config "$PIPELINE_ROBOT_CONFIG"
     --output "$PIPELINE_ROBOT_DIR/robot_plan.json"
-    --mode "$PIPELINE_ROBOT_MODE"
+    --execute
     --maximum-validation-age-seconds "$PIPELINE_COLLISION_MAX_AGE"
     --confirm "$PIPELINE_CONFIRM"
   )
@@ -486,7 +470,6 @@ case $PIPELINE_STAGE in
       printf 'Robot plan: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan.json"
       printf 'Collision validation: %s\n' "$PIPELINE_ROBOT_DIR/collision_validation.json"
       printf 'Robot execution: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan_execution.json"
-      printf 'Robot mode: %s\n' "$PIPELINE_ROBOT_MODE"
     fi
     ;;
   icar)
@@ -530,7 +513,6 @@ case $PIPELINE_STAGE in
   robot-execute)
     run_robot_execute
     printf '검증된 xArm7 plan 실행 완료\n'
-    printf 'Mode: %s\n' "$PIPELINE_ROBOT_MODE"
     printf 'Execution: %s\n' "$PIPELINE_ROBOT_DIR/robot_plan_execution.json"
     ;;
 esac

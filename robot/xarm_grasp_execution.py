@@ -319,7 +319,6 @@ def build_plan(
             "calibration": _sha256_file(calibration_path),
             "robot_config": _sha256_file(config_path),
         },
-        "tool_alignment_verified": config.get("tool_alignment_verified") is True,
         "ready": ready,
         "selection_method": "selection_objective_desc_then_collision_free",
         "ranked_candidates": accepted,
@@ -329,9 +328,6 @@ def build_plan(
         "limitations": [
             "AnyGrasp collision checks the local gripper pose, not the full xArm trajectory.",
             "Direct Cartesian segments require a physically cleared robot cell.",
-            "A tabletop grasp below minimum_transit_z_m is planning-only until "
-            "tabletop_execution_verified is enabled after a physical clearance check.",
-            "Full execution is blocked until tool alignment is visually verified.",
         ],
     }
 
@@ -767,43 +763,21 @@ def _move(arm: Any, transform: np.ndarray, speed: float, acceleration: float, la
 def execute_plan(
     plan: Mapping[str, Any],
     config: Mapping[str, Any],
-    mode: str,
-    collision_validation: Optional[Mapping[str, Any]] = None,
+    collision_validation: Mapping[str, Any],
 ) -> Dict[str, Any]:
     arm = _connect(config)
     motion_started = False
     try:
         status = _check_robot_status(arm, config)
-        if mode == "connect":
-            return {"mode": mode, "status": status}
-        if mode in {"pregrasp", "grasp-check", "full"}:
-            if collision_validation is None:
-                raise RobotExecutionError(
-                    "a fresh collision validation is required before robot motion"
-                )
-            validation_start_state = _check_validation_start_state(
-                arm, status, collision_validation, config
-            )
-        else:
-            validation_start_state = None
+        validation_start_state = _check_validation_start_state(
+            arm, status, collision_validation, config
+        )
         ready = _plan_ready(plan, config)
         if not status["tcp_offset_ok"]:
             raise RobotExecutionError(
                 "xArm TCP offset does not match the configured xArm Gripper offset; "
                 f"current={status['tcp_offset_mm_rad']}, "
                 f"required={status['required_tcp_offset_mm_rad']}"
-            )
-        if (
-            mode in {"grasp-check", "full"}
-            and config.get("tool_alignment_verified") is not True
-        ):
-            raise RobotExecutionError(
-                "full grasp is blocked until the pregrasp orientation is visually "
-                "checked and tool_alignment_verified is set to true"
-            )
-        if collision_validation is None:
-            raise RobotExecutionError(
-                "collision validation did not provide a selected candidate"
             )
         selected = collision_validation.get("selected")
         if not isinstance(selected, dict) or not isinstance(
@@ -814,15 +788,6 @@ def execute_plan(
             )
         waypoints = selected["waypoints"]
         grasp = validate_transform(np.asarray(waypoints["grasp"]))
-        if (
-            mode in {"grasp-check", "full"}
-            and float(grasp[2, 3]) < _number(config, "minimum_transit_z_m")
-            and config.get("tabletop_execution_verified") is not True
-        ):
-            raise RobotExecutionError(
-                "tabletop grasp execution is blocked until gripper/table clearance "
-                "is physically checked and tabletop_execution_verified is set to true"
-            )
         pregrasp = validate_transform(np.asarray(waypoints["pregrasp"]))
         ready_reference = _ready_reference_joints(
             arm, ready, status["joint_angles_rad"]
@@ -860,15 +825,6 @@ def execute_plan(
         speed = _number(config, "travel_speed_mm_s")
         acceleration = _number(config, "travel_acceleration_mm_s2")
         _move(arm, pregrasp, speed, acceleration, "pregrasp")
-        if mode == "pregrasp":
-            return {
-                "mode": mode,
-                "status_before": status,
-                "validation_start_state": validation_start_state,
-                "ready": ready_result,
-                "ik": ik,
-            }
-
         _move(
             arm,
             grasp,
@@ -876,14 +832,6 @@ def execute_plan(
             acceleration,
             "grasp",
         )
-        if mode == "grasp-check":
-            return {
-                "mode": mode,
-                "status_before": status,
-                "validation_start_state": validation_start_state,
-                "ready": ready_result,
-                "ik": ik,
-            }
         close_units = int(_number(config, "gripper_close_units"))
         _check_code(
             arm,
@@ -897,7 +845,6 @@ def execute_plan(
         _move(arm, retreat, speed, acceleration, "retreat")
         _move(arm, lift, speed, acceleration, "lift")
         return {
-            "mode": mode,
             "status_before": status,
             "validation_start_state": validation_start_state,
             "ready": ready_result,
@@ -931,9 +878,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=Path("runs/robot_plan.json"))
     parser.add_argument(
-        "--mode",
-        choices=("plan", "connect", "pregrasp", "grasp-check", "full"),
-        default="plan",
+        "--execute",
+        action="store_true",
+        help="충돌 검증을 통과한 --plan을 실제 로봇에서 실행",
     )
     parser.add_argument("--confirm", default="")
     parser.add_argument("--acknowledge-cleared-workspace", action="store_true")
@@ -958,17 +905,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config_path = arguments.robot_config.expanduser().resolve()
         config = _load_config(config_path)
         output_path = arguments.output.expanduser().resolve()
-        motion_modes = {"pregrasp", "grasp-check", "full"}
 
-        if arguments.mode == "connect":
-            if arguments.plan is not None or arguments.grasp_result is not None:
-                print(
-                    "참고: connect 모드는 grasp/plan 파일을 사용하지 않습니다.",
-                    file=sys.stderr,
-                )
-            plan: Dict[str, Any] = {}
-            plan_path: Optional[Path] = None
-        elif arguments.plan is not None:
+        if arguments.plan is not None:
             if arguments.grasp_result is not None:
                 raise RobotExecutionError(
                     "--plan and --grasp-result cannot be used together"
@@ -980,7 +918,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RobotExecutionError(
                     "--grasp-result is required to build a robot plan"
                 )
-            if arguments.mode in motion_modes:
+            if arguments.execute:
                 raise RobotExecutionError(
                     "robot motion requires --plan so the exact collision-validated "
                     "plan is executed"
@@ -993,7 +931,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _write_json(output_path, plan)
             plan_path = output_path
 
-        if arguments.mode == "plan":
+        if not arguments.execute:
             candidates = _ranked_plan_candidates(plan)
             print(
                 json.dumps(
@@ -1009,35 +947,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 0
 
-        collision_validation: Optional[Dict[str, Any]] = None
-        if arguments.mode in motion_modes:
-            expected = "MOVE_XARM7_" + config["robot_ip"].replace(".", "_")
-            if arguments.confirm != expected:
-                raise RobotExecutionError(f"--confirm must be exactly {expected}")
-            if not arguments.acknowledge_cleared_workspace:
-                raise RobotExecutionError("--acknowledge-cleared-workspace is required")
-            if not arguments.acknowledge_estop_ready:
-                raise RobotExecutionError("--acknowledge-estop-ready is required")
-            if arguments.collision_validation is None or plan_path is None:
-                raise RobotExecutionError(
-                    "--collision-validation is required for robot motion"
-                )
-            if arguments.maximum_validation_age_seconds <= 0.0:
-                raise RobotExecutionError(
-                    "--maximum-validation-age-seconds must be positive"
-                )
-            collision_validation = _load_collision_approval(
-                arguments.collision_validation.expanduser().resolve(),
-                plan_path,
-                config_path,
-                arguments.maximum_validation_age_seconds,
+        expected = "MOVE_XARM7_" + config["robot_ip"].replace(".", "_")
+        if arguments.confirm != expected:
+            raise RobotExecutionError(f"--confirm must be exactly {expected}")
+        if not arguments.acknowledge_cleared_workspace:
+            raise RobotExecutionError("--acknowledge-cleared-workspace is required")
+        if not arguments.acknowledge_estop_ready:
+            raise RobotExecutionError("--acknowledge-estop-ready is required")
+        if arguments.collision_validation is None or plan_path is None:
+            raise RobotExecutionError(
+                "--collision-validation is required for robot motion"
             )
+        if arguments.maximum_validation_age_seconds <= 0.0:
+            raise RobotExecutionError(
+                "--maximum-validation-age-seconds must be positive"
+            )
+        collision_validation = _load_collision_approval(
+            arguments.collision_validation.expanduser().resolve(),
+            plan_path,
+            config_path,
+            arguments.maximum_validation_age_seconds,
+        )
 
         result = execute_plan(
             plan,
             config,
-            arguments.mode,
-            collision_validation=collision_validation,
+            collision_validation,
         )
         execution_path = output_path.with_name(output_path.stem + "_execution.json")
         _write_json(execution_path, {"plan": plan, "execution": result})

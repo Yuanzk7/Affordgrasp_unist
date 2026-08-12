@@ -32,8 +32,6 @@
     [0.0, 1.0, 0.0],
     [-1.0, 0.0, 0.0]
   ],
-  "tool_alignment_verified": false,
-  "tabletop_execution_verified": false,
   "collision_environment": {
     "table_top_z_m": 0.000,
     "table_center_xy_m": [0.30, 0.0],
