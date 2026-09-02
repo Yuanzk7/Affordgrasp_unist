@@ -5,8 +5,8 @@ from typing import Any, Dict
 
 SYSTEM_PROMPT = """
 You are the visual affordance reasoning module of a robotic grasping system.
-Jointly inspect the RGB scene and the user's instruction. Return concise,
-observable evidence, not hidden chain-of-thought.
+Jointly inspect the RGB scene and the user's instruction. Perform the reasoning
+steps internally and return only the four canonical result fields.
 
 Follow the three AffordGrasp steps:
 1. Task analysis: infer the explicit task goal and functional requirements from
@@ -30,18 +30,14 @@ Safety rules:
 - Select a graspable contact region, not a sharp edge, hot surface, liquid,
   task-active blade/tip, or occluded/inaccessible part.
 - If no suitable object is visible, the target or part is ambiguous, or safe
-  grasping cannot be justified, set is_actionable to false and explain why in
-  failure_reason. Use "none" for unknown canonical labels.
-- confidence is a calibrated estimate from 0 to 1 based on visibility,
-  ambiguity, task fit, and part accessibility. It is not robot authorization.
+  grasping cannot be justified, use "none" for every canonical label that
+  cannot be determined. Never guess a missing label.
 
 In-context example:
 User goal: "I need to tighten screws; choose the right tool."
 Visible scene: a screwdriver, cup, and sponge.
 Result summary: task="tighten screws", object="screwdriver",
-object_part="handle", affordance="grasp", is_actionable=true. The handle is
-selected because it supports a secure grip and preserves the screwdriver tip
-for the task.
+object_part="handle", affordance="grasp".
 """.strip()
 
 
@@ -53,22 +49,6 @@ RESPONSE_FORMAT: Dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "task_analysis": {
-                "type": "string",
-                "description": "Concise explicit goal and functional requirement.",
-            },
-            "object_identification": {
-                "type": "string",
-                "description": "Visible evidence and why this object best fits.",
-            },
-            "part_selection": {
-                "type": "string",
-                "description": "Why this visible part should be grasped.",
-            },
-            "affordance_reasoning": {
-                "type": "string",
-                "description": "Physical properties supporting the affordance.",
-            },
             "task": {
                 "type": "string",
                 "description": "Short English task phrase.",
@@ -85,32 +65,12 @@ RESPONSE_FORMAT: Dict[str, Any] = {
                 "type": "string",
                 "description": "Short English base-form affordance verb.",
             },
-            "is_actionable": {
-                "type": "boolean",
-                "description": "Whether one safe visible target is unambiguous.",
-            },
-            "confidence": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1,
-            },
-            "failure_reason": {
-                "type": "string",
-                "description": "Empty only when actionable; otherwise the blocker.",
-            },
         },
         "required": [
-            "task_analysis",
-            "object_identification",
-            "part_selection",
-            "affordance_reasoning",
             "task",
             "object",
             "object_part",
             "affordance",
-            "is_actionable",
-            "confidence",
-            "failure_reason",
         ],
     },
 }

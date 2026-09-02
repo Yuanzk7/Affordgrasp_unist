@@ -36,9 +36,10 @@ IMAGE_MIME_BY_SUFFIX = {
 }
 
 SUPPORTED_PROVIDERS = {"openai", "gemini"}
+DEFAULT_PROVIDER = "gemini"
 DEFAULT_MODELS = {
     "openai": "gpt-5.6-terra",
-    "gemini": "gemini-3.6-flash",
+    "gemini": "gemini-3.5-flash-lite",
 }
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
@@ -51,7 +52,7 @@ class AffordanceReasonerConfig:
     image_detail: str = "high"
     reasoning_effort: str = "medium"
     timeout_seconds: float = 60.0
-    provider: str = "openai"
+    provider: str = DEFAULT_PROVIDER
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str):
@@ -148,20 +149,8 @@ class AffordanceReasoner:
 
         api_key = os.environ.get(key_name, "").strip()
         if not api_key:
-            try:
-                from .. import local_config
-            except ImportError:
-                local_config = None
-            local_value = (
-                getattr(local_config, key_name, "") if local_config else ""
-            )
-            if isinstance(local_value, str):
-                api_key = local_value.strip()
-
-        if not api_key:
             raise ConfigurationError(
-                f"{provider_name} API key is missing; set {key_name} "
-                "or configure affordgrasp_icar/local_config.py"
+                f"{provider_name} API key is missing; set {key_name}"
             )
         try:
             from openai import OpenAI
@@ -207,7 +196,7 @@ class AffordanceReasoner:
             "text": {"format": RESPONSE_FORMAT},
             "store": False,
         }
-        if self.config.model and self.config.model.startswith("gpt-5"):
+        if self.config.model.startswith("gpt-5"):
             arguments["reasoning"] = {"effort": self.config.reasoning_effort}
         return arguments
 

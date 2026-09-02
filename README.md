@@ -61,6 +61,7 @@ conda run --prefix "$AFFORDGRASP_ANYGRASP_ENV" \
 `AFFORDGRASP_XARM_ROS2_ROOT`로 지정한다.
 
 API 키는 파일에 저장하지 않고 셸 환경변수로 제공한다.
+ICAR의 현재 기본 모델은 코드에 지정된 `gemini-3.5-flash-lite`이다.
 
 ```bash
 export GEMINI_API_KEY="your-api-key"
@@ -127,7 +128,8 @@ CONFIRM_TOKEN="MOVE_XARM7_${AFFORDGRASP_ROBOT_IP//./_}"
 ## 5. 전체 처리 순서
 
 1. D435에서 RGB, raw/filtered depth와 카메라 내부 파라미터를 저장한다.
-2. ICAR가 작업 지시에서 대상 물체, 잡을 부위와 affordance를 추론한다.
+2. ICAR가 작업 지시에서 `task`, `object`, `object_part`, `affordance`를
+   추론한다.
 3. VLPart가 대상 물체를 찾고 잡을 부위의 mask를 생성한다.
 4. AnyGrasp가 grasp 후보와 그리퍼 자세를 생성한다.
 5. Eye-to-hand 행렬로 후보를 xArm base 좌표계 경로로 변환한다.
@@ -180,6 +182,9 @@ runs/<prefix>/affordance_mask/
 runs/<prefix>/grasp/      grasp pose와 point cloud
 runs/<prefix>/robot/      plan, 충돌 검증, 실행 기록
 ```
+
+ICAR는 `<prefix>_rgb.png` 이미지 이름에서 `<prefix>`를 자동으로 추출해
+`runs/<prefix>/json`에 결과를 저장한다.
 
 실제 실행 전에는 다음 파일을 확인한다.
 
