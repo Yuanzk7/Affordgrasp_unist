@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from ..camera import CameraCaptureError, capture_realsense
 from .models import UnsafeGroundingRequest
 from .reasoner import (
     AffordanceReasoner,
@@ -55,6 +54,8 @@ def _result_dir(image_path: str) -> Path:
 
 
 def _run_camera(prefix: str) -> int:
+    from ..camera import CameraCaptureError, capture_realsense
+
     try:
         capture = capture_realsense(output_dir=CAPTURE_DIR, prefix=prefix)
     except (CameraCaptureError, ValueError) as exc:
