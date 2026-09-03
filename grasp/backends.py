@@ -7,7 +7,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -63,6 +63,7 @@ class AnyGraspBackend:
         anygrasp_sdk: Optional[Path],
         max_gripper_width_m: float,
         gripper_height_m: float,
+        max_scene_points: int = 80_000,
     ) -> None:
         self.detection_dir = _resolve_anygrasp_detection_dir(anygrasp_sdk)
         if checkpoint_path is None:
@@ -89,8 +90,49 @@ class AnyGraspBackend:
             raise ValueError("max_gripper_width must be in (0, 0.10]")
         if gripper_height_m <= 0.0:
             raise ValueError("gripper_height must be positive")
+        if max_scene_points <= 0:
+            raise ValueError("max_scene_points must be positive")
         self.max_gripper_width_m = float(max_gripper_width_m)
         self.gripper_height_m = float(gripper_height_m)
+        self.max_scene_points = int(max_scene_points)
+
+    def _subsample_input(
+        self,
+        scene_points: np.ndarray,
+        affordance_region: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Limit GPU memory while retaining target-region representation."""
+
+        point_count = len(scene_points)
+        if point_count <= self.max_scene_points:
+            return scene_points, affordance_region
+
+        region_indices = np.flatnonzero(affordance_region)
+        background_indices = np.flatnonzero(~affordance_region)
+        # Reserve up to one quarter for affordance points, then use the rest
+        # for scene context and model-free collision detection.
+        region_quota = min(len(region_indices), max(1, self.max_scene_points // 4))
+        background_quota = min(
+            len(background_indices), self.max_scene_points - region_quota
+        )
+        region_quota = min(
+            len(region_indices), self.max_scene_points - background_quota
+        )
+
+        random = np.random.default_rng(0)
+        if len(region_indices) > region_quota:
+            region_indices = random.choice(
+                region_indices, region_quota, replace=False
+            )
+        if len(background_indices) > background_quota:
+            background_indices = random.choice(
+                background_indices, background_quota, replace=False
+            )
+        selected = np.sort(np.concatenate((region_indices, background_indices)))
+        return (
+            np.ascontiguousarray(scene_points[selected], dtype=np.float32),
+            np.ascontiguousarray(affordance_region[selected], dtype=bool),
+        )
 
     def _create_detector(self) -> Any:
         try:
@@ -131,6 +173,17 @@ class AnyGraspBackend:
                 grasp_input.affordance_region_mask,
                 dtype=bool,
             )
+            original_point_count = len(scene_points)
+            scene_points, affordance_region = self._subsample_input(
+                scene_points,
+                affordance_region,
+            )
+            if len(scene_points) < original_point_count:
+                print(
+                    "AnyGrasp scene subsampling: "
+                    f"{original_point_count} -> {len(scene_points)} points "
+                    f"(affordance={int(np.count_nonzero(affordance_region))})"
+                )
             inference_options = {
                 "dense_grasp": False,
                 "collision_detection": True,
@@ -194,6 +247,8 @@ class AnyGraspBackend:
                         "region_steering": True,
                         "collision_detection": True,
                         "dense_grasp": False,
+                        "original_scene_point_count": original_point_count,
+                        "backend_input_point_count": len(scene_points),
                     },
                 )
             )

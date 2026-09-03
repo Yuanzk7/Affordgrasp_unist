@@ -375,6 +375,7 @@ def _create_backend(arguments: argparse.Namespace) -> GraspBackend:
         anygrasp_sdk=arguments.anygrasp_sdk,
         max_gripper_width_m=arguments.max_gripper_width,
         gripper_height_m=arguments.gripper_height,
+        max_scene_points=arguments.max_scene_points,
     )
 
 
@@ -425,6 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-depth", type=float, default=2.00)
     parser.add_argument("--max-gripper-width", type=float, default=0.10)
     parser.add_argument("--gripper-height", type=float, default=0.03)
+    parser.add_argument(
+        "--max-scene-points",
+        type=int,
+        default=80_000,
+        help="AnyGrasp에 전달할 최대 scene point 수 (기본: 80000)",
+    )
     parser.add_argument(
         "--max-vis-points",
         type=int,

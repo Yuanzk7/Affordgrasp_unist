@@ -102,6 +102,73 @@ PYTHONPATH=.. python -m affordgrasp_icar.robot.eye_to_hand_calibration \
 
 ## 4. 실행
 
+### ThinkGrasp 시뮬레이션
+
+시뮬레이션의 기본 로봇은 공식 `xarm_ros2` 모델을 사용한 xArm7 + xArm
+Gripper다. 최초 실행 시 통합 URDF를 `runs/_simulation/`에 자동 생성한다.
+`xarm_ros2`가 저장소의 `./xarm_ros2`에 없으면 `--xarm-root`로 경로를
+지정한다. URDF 생성에는 `config.env`의 `AFFORDGRASP_ANYGRASP_ENV`에 설치된
+`xacro`를 사용한다.
+
+ThinkGrasp 장면을 열고 AffordGrasp 형식의 RGB-D 입력만 저장한다.
+
+```bash
+conda run --no-capture-output -n thinkgrasp \
+  python simulation/run_affordgrasp_sim.py \
+  --prefix sim_case00
+```
+
+ICAR → VLPart → affordance mask → AnyGrasp까지 실행하고, 선택한 grasp 축을
+PyBullet 화면에 표시한다. 이 명령은 아직 로봇을 움직이지 않는다.
+
+```bash
+conda run --no-capture-output -n thinkgrasp \
+  python simulation/run_affordgrasp_sim.py \
+  --prefix sim_case00 \
+  --instruction "grasp a ball" \
+  --run-pipeline
+```
+
+결과를 확인한 뒤 시뮬레이션 xArm7로 접근, 그리퍼 폐쇄, 리프트까지 수행하려면
+`--execute`를 추가한다. 이 경로는 실제 xArm에 연결하거나 명령을 보내지
+않는다. xArm Gripper의 메시 접촉 오차 때문에 양쪽 손가락의 접촉이 실제로
+검출된 경우에만 리프트 중 grasp 안정화 제약을 적용한다.
+`--execute` 실행 전에는 접근 각도 조건을 적용한 뒤 각 후보의
+`pregrasp → grasp` 경로를 xArm7 IK로 검사한다. 도달 가능한 후보가 없으면
+로봇을 움직이지 않고 오류로 종료한다.
+
+GUI 로봇 동작은 기본 0.5배속으로 재생한다. 더 천천히 확인하려면
+`--simulation-speed 0.25`를 사용하고, 실시간 속도는 `1.0`으로 지정한다.
+이 옵션은 `--no-gui` 실행 성능에는 영향을 주지 않는다.
+
+```bash
+conda run --no-capture-output -n thinkgrasp \
+  python simulation/run_affordgrasp_sim.py \
+  --prefix sim_case00 \
+  --instruction "grasp a ball" \
+  --run-pipeline \
+  --execute
+```
+
+기존 grasp 결과만 다시 실행할 때는 다음처럼 `--grasp-result`를 사용한다.
+
+```bash
+conda run --no-capture-output -n thinkgrasp \
+  python simulation/run_affordgrasp_sim.py \
+  --prefix sim_replay \
+  --grasp-result runs/sim_case00/grasp/grasp_pose_result.json \
+  --execute
+```
+
+다른 ThinkGrasp 장면은 `--case heavy_unseen/case04-fruit.txt`처럼 지정한다.
+시뮬레이터는 `thinkgrasp` 환경을 사용하고, ICAR는 기본 Conda Python,
+VLPart와 AnyGrasp는 `config.env`에 설정된 환경을 사용한다. 기본 Conda
+Python이 아닌 환경에서 ICAR를 실행하려면 `--icar-python`을 지정한다.
+
+기본 장면은 전체 파이프라인 확인을 위해 공 하나가 잘 보이도록 구성했다.
+`heavy_unseen/case00-round.txt`는 정답 공이 다른 물체에 가려질 수 있으므로,
+한 번의 AffordGrasp 실행이 아니라 가림 물체를 반복해서 제거하는 평가에 사용한다.
+
 **인식과 grasp 생성만 실행 — 로봇은 움직이지 않음**
 
 ```bash
